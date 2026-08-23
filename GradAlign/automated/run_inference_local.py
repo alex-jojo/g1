@@ -29,10 +29,10 @@ def main():
     parser.add_argument("--concurrency", default=8, type=int)
     parser.add_argument("--max_tokens", default=4096, type=int)
     parser.add_argument("--temperature", default=0.7, type=float)
-    parser.add_argument("--use_model_judge", action="store_true", default=False,
-                        help="Enable model judge fallback after rule-based checks")
-    parser.add_argument("--model_judge_concurrency", default=1024, type=int,
-                        help="Maximum concurrent requests for model judge")
+    parser.add_argument("--reward_path", default=None, type=str,
+                        help="VERL-compatible custom reward Python file")
+    parser.add_argument("--reward_name", default="compute_score", type=str)
+    parser.add_argument("--reward_manifest_path", default=None, type=str)
 
     args = parser.parse_args()
 
@@ -62,11 +62,12 @@ def main():
         "--concurrency", str(args.concurrency),
         "--max_tokens", str(args.max_tokens),
         "--temperature", str(args.temperature),
-        # temperature is not directly accepted by inference_ray_batch.py sampling params; keep default inside
     ]
-    if args.use_model_judge:
-        cmd.append("--use_model_judge")
-        cmd.extend(["--model_judge_concurrency", str(max(1, args.model_judge_concurrency))])
+    if args.reward_path:
+        cmd.extend(["--reward_path", args.reward_path])
+    cmd.extend(["--reward_name", args.reward_name])
+    if args.reward_manifest_path:
+        cmd.extend(["--reward_manifest_path", args.reward_manifest_path])
 
     print("Executing:", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -87,5 +88,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

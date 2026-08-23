@@ -48,8 +48,8 @@ def main():
                        help="Path to the model to analyze")
     parser.add_argument("--train_responses_dir", type=str, required=True,
                        help="Directory containing pre-generated train responses")
-    parser.add_argument("--val_responses_dir", type=str, required=True,
-                       help="Directory containing pre-generated validation responses")
+    parser.add_argument("--val_responses_dir", type=str, default=None,
+                       help="Directory containing validation responses (not used in svd mode)")
     parser.add_argument("--output_path", type=str, 
                        default="~/data_selection/data/analysis/gradient_similarities_parallel.json",
                        help="Output file for similarity results")
@@ -87,10 +87,16 @@ def main():
     parser.add_argument("--optimizer_state_path", type=str, default=None,
                        help="Path to converted optimizer state (required when --use_optimizer)")
     parser.add_argument("--mode", default='sim', type=str)
+    parser.add_argument("--svd_rank", default=128, type=int,
+                       help="Number of leading singular values saved per 2-D layer gradient in svd mode")
     args = parser.parse_args()
 
     if args.use_optimizer and not args.optimizer_state_path:
         parser.error("--optimizer_state_path must be provided when --use_optimizer is set")
+    if args.mode != 'svd' and not args.val_responses_dir:
+        parser.error("--val_responses_dir is required unless --mode svd is used")
+    if args.mode == 'svd' and args.use_optimizer:
+        parser.error("--use_optimizer is incompatible with --mode svd; SVD uses raw GRPO gradients")
 
     # Auto-run CPU tokenization (prepare.py) if shards are missing
     def _shards_exist(responses_dir: str, world_size: int, prefix: str = "data_") -> bool:
@@ -115,16 +121,17 @@ def main():
         print(' '.join(cmd))
         subprocess.run(cmd, check=True)
 
-    # Ensure shards for both train and val
+    # Ensure train shards, plus validation shards only for alignment modes.
     if not _shards_exist(args.train_responses_dir, args.num_gpus):
         _run_prepare(args.train_responses_dir, args.model_path, args.num_gpus, args.max_length, 128)
     else:
         print(f"Train shards already present under {args.train_responses_dir}; skipping prepare")
 
-    if not _shards_exist(args.val_responses_dir, args.num_gpus):
-        _run_prepare(args.val_responses_dir, args.model_path, args.num_gpus, args.max_length, 128)
-    else:
-        print(f"Val shards already present under {args.val_responses_dir}; skipping prepare")
+    if args.mode != 'svd':
+        if not _shards_exist(args.val_responses_dir, args.num_gpus):
+            _run_prepare(args.val_responses_dir, args.model_path, args.num_gpus, args.max_length, 128)
+        else:
+            print(f"Val shards already present under {args.val_responses_dir}; skipping prepare")
     
     # Create accelerate config if not provided
     if args.config_file is None:
@@ -143,7 +150,6 @@ def main():
         "analyze_grpo_parallel.py",
         "--model_path", args.model_path,
         "--train_responses_dir", args.train_responses_dir,
-        "--val_responses_dir", args.val_responses_dir,
         "--output_path", args.output_path,
         "--kl_loss_coef", str(args.kl_loss_coef),
         "--clip_ratio", str(args.clip_ratio),
@@ -151,10 +157,15 @@ def main():
         "--max_length", str(args.max_length),
         "--mixed_precision", args.mixed_precision,
         "--fsdp_auto_wrap_policy", args.fsdp_auto_wrap_policy,
-        "--max_num_samples", str(args.max_num_samples),
         "--problem_set_path", args.problem_set_path,
         "--mode", args.mode,
+        "--svd_rank", str(args.svd_rank),
     ]
+
+    if args.mode != 'svd':
+        launch_cmd.extend(["--val_responses_dir", args.val_responses_dir])
+    if args.max_num_samples is not None:
+        launch_cmd.extend(["--max_num_samples", str(args.max_num_samples)])
     
     # Add optional flags
     if args.norm_before_accumlation:
@@ -195,4 +206,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

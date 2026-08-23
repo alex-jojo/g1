@@ -131,14 +131,15 @@ python dynamic_selection.py \
   --model qwen3-8b-base \
   --train_dataset webinstruct \
   --val_dataset amc22 \
-  --chunk_size 5120 \
-  --k 20 \
-  --mode sim \
+  --chunk_size 2560 \
+  --k 2 \
+  --mode svd \
   --num_selections 100 \
   --train_batch_size 128 \
   --iters_per_select 10 \
-  --n_samples_train 128 \
-  --n_samples_val 16 \
+  --n_samples_train 8 \
+  --analysis_num_gpus 4 \
+  --svd_rank 128 \
   --minibatch_size 8 \
   --max_tokens 3072 \
   --max_model_len 4096 \
@@ -148,14 +149,18 @@ python dynamic_selection.py \
 
 Important arguments:
 - `--chunk_size`: number of candidate problems per round (`M` in paper).
-- `--k`: selection ratio (`q` in paper), selecting `chunk_size / k` each round.
+- `--k`: selection-ratio denominator (`q` in paper), selecting `chunk_size / k` each round; `k=2` keeps the top 50%.
 - `--mode`: selection policy (`sim`, `dot`, `accgreedy`, `align`, `rand`, ...).
 - `--n_samples_train`, `--n_samples_val`: rollout counts used in gradient estimation (`k_r`, `k_v`).
 - `--iters_per_select`: GRPO update steps between selection rounds.
 - `--num_selections`: number of selection rounds.
 
-Constraint enforced by code:
-- `(k * train_batch_size * iters_per_select) % chunk_size == 0`
+The example scores 2560 prompts, selects the top 1280 by SVD effective-rank score,
+then trains exactly 10 GRPO global steps (one epoch at batch size 128) before selecting again.
+
+Constraints enforced by code:
+- `chunk_size % k == 0`
+- `(train_batch_size * iters_per_select) % (chunk_size / k) == 0`
 
 ## 5) Baselines
 

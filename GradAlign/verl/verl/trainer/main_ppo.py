@@ -283,12 +283,15 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # Load the reward manager for training and validation.
+        # Load validation resources only when validation files are configured.
+        validation_enabled = bool(config.data.get("val_files"))
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+        val_reward_fn = (
+            load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
+            if validation_enabled
+            else None
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
@@ -304,14 +307,16 @@ class TaskRunner:
             is_train=True,
             max_samples=config.data.get("train_max_samples", -1),
         )
-        val_dataset = create_rl_dataset(
-            config.data.val_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=False,
-            max_samples=config.data.get("val_max_samples", -1),
-        )
+        val_dataset = None
+        if validation_enabled:
+            val_dataset = create_rl_dataset(
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=False,
+                max_samples=config.data.get("val_max_samples", -1),
+            )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.

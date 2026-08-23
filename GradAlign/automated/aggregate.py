@@ -132,6 +132,18 @@ def main():
         type=str,
         help="Per-part similarity filename to aggregate",
     )
+    parser.add_argument(
+        "--score_mode",
+        choices=["similarity", "svd"],
+        default="similarity",
+        help="Aggregate GradAlign similarity records or SVD effective-rank records",
+    )
+    parser.add_argument(
+        "--svd_rank",
+        default=128,
+        type=int,
+        help="Top-k rank used in SVD result filenames",
+    )
 
     args = parser.parse_args()
 
@@ -139,15 +151,21 @@ def main():
     if not os.path.isdir(parts_root):
         raise SystemExit(f"Parts root not found: {parts_root}")
 
-    sim_out = os.path.join(parts_root, "similarity_results_aggregated.jsonl")
+    if args.score_mode == "svd":
+        per_part_filename = f"svd_results_top{args.svd_rank}.jsonl"
+        sim_out = os.path.join(parts_root, f"svd_results_top{args.svd_rank}_aggregated.jsonl")
+    else:
+        per_part_filename = args.similarity_filename
+        sim_out = os.path.join(parts_root, "similarity_results_aggregated.jsonl")
     acc_out = os.path.join(parts_root, "accuracy_by_problem.jsonl")
 
-    total_sim = aggregate_similarity(parts_root, args.similarity_filename, sim_out)
-    sim_map = None if not total_sim else {}
-    if sim_map is not None:
+    total_sim = aggregate_similarity(parts_root, per_part_filename, sim_out)
+    sim_map = None
+    if args.score_mode == "similarity" and total_sim:
+        sim_map = {}
         for entry in total_sim:
             sim_map[entry['group_id']] = entry['similarity']
-    print(f"Aggregated {len(total_sim)} similarity lines into {sim_out}")
+    print(f"Aggregated {len(total_sim)} {args.score_mode} lines into {sim_out}")
 
     written_acc = aggregate_accuracy(parts_root, acc_out, num_workers=args.num_workers, sim_map = sim_map)
     print(f"Wrote {written_acc} accuracy records to {acc_out}")
@@ -155,5 +173,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

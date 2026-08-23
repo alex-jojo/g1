@@ -12,27 +12,51 @@ Ray Data provides:
 """
 
 import argparse
-import asyncio
+import base64
 import json
 import os
+import subprocess
 import sys
 import time
+import zlib
 from typing import List, Dict, Any, Callable, Optional, cast, Tuple
-from datetime import datetime
 
+import numpy as np
 import ray
 from packaging.version import Version
 from ray.data.llm import build_llm_processor, vLLMEngineProcessorConfig
 
-# Add parent directory to path to import utils
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import compare_answers, extract_answer
-from verl.utils.reward_score.model_reward import compute_score  # type: ignore[import-not-found]
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_REWARD_PATH = os.path.join(
+    REPO_ROOT, "rewards", "grpo_math_verify_reward.py"
+)
+SCORE_RESPONSES_SCRIPT = os.path.join(
+    REPO_ROOT, "automated", "score_responses.py"
+)
 
 # Check Ray version
 assert Version(ray.__version__) >= Version("2.44.1"), (
     "Ray version must be at least 2.44.1 for native vLLM integration"
 )
+
+
+TOKEN_SCHEMA_VERSION = 1
+TOKEN_IDS_ENCODING = "zlib+base64+uint32-le"
+
+
+def encode_token_ids(value: Any, field_name: str) -> Tuple[str, int]:
+    """Encode exact engine token IDs compactly without a text round trip."""
+    if value is None:
+        raise ValueError(f"Ray/vLLM output is missing {field_name}")
+    token_ids = np.asarray(value, dtype=np.int64).reshape(-1)
+    if token_ids.size and (
+        int(token_ids.min()) < 0
+        or int(token_ids.max()) > int(np.iinfo(np.uint32).max)
+    ):
+        raise ValueError(f"{field_name} contains an ID outside uint32 range")
+    raw = token_ids.astype("<u4", copy=False).tobytes()
+    encoded = base64.b64encode(zlib.compress(raw)).decode("ascii")
+    return encoded, int(token_ids.size)
 
 
 def load_and_preprocess_data(prompts_file: str, min_problems: Optional[int] = None, max_problems: Optional[int] = None, n_samples: int = 5) -> List[Dict]:
@@ -95,77 +119,6 @@ def load_and_preprocess_data(prompts_file: str, min_problems: Optional[int] = No
     return processed_data
 
 
-async def _judge_responses_async(
-    entries: List[Tuple[int, Dict[str, Any]]],
-    concurrency: int,
-) -> None:
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-
-    async def _evaluate(idx: int, payload: Dict[str, Any]) -> None:
-        async with semaphore:
-            try:
-                score = await compute_score(
-                    task=payload["data_source"],
-                    solution_str=payload["response"],
-                    ground_truth=payload["expected_answer"],
-                    extra_info=payload.get("extra_info", {}),
-                )
-                payload["score"] = float(score)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[Model Judge] Error for index {idx}: {exc}")
-                payload["score"] = 0.0
-
-    await asyncio.gather(*(_evaluate(idx, payload) for idx, payload in entries))
-
-
-def run_model_judge(
-    results: List[Dict[str, Any]],
-    concurrency: int,
-) -> int:
-    judge_candidates: List[Tuple[int, Dict[str, Any]]] = []
-    for idx, item in enumerate(results):
-        # if item.get("passed", item.get("is_correct", False)):
-        #     continue
-        expected_answer = str(item.get("expected_answer", "")).strip()
-        if not expected_answer:
-            continue
-        original_data = item.get("original_data") or {}
-        extra_info: Dict[str, Any] = {}
-        if isinstance(original_data, dict):
-            original_entry = original_data.get("original_entry")
-            if isinstance(original_entry, dict):
-                extra_info = original_entry.get("extra_info", {})
-            else:
-                extra_info = original_data.get("extra_info", {})
-
-        judge_candidates.append(
-            (
-                idx,
-                {
-                    "data_source": item["data_source"],
-                    "response": item.get("response", ""),
-                    "expected_answer": expected_answer,
-                    "extra_info": extra_info,
-                },
-            )
-        )
-
-    if not judge_candidates:
-        return 0
-
-    asyncio.run(_judge_responses_async(judge_candidates, concurrency))
-
-    updated = 0
-    for idx, payload in judge_candidates:
-        score = float(payload.get("score", 0.0))
-        results[idx]["model_judge_score"] = score
-        results[idx]["passed"] = score >= 0.5
-        results[idx]["is_correct"] = score >= 0.5
-        updated += 1
-        print('fafa', results[idx]['passed'], results[idx]["model_judge_score"])
-    return updated
-
-
 def make_preprocess_for_vllm(
     max_tokens: int,
     temperature: float = 0.7,
@@ -213,6 +166,7 @@ def make_preprocess_for_vllm(
                 "max_tokens": int(max_tokens),
                 "top_p": top_p,
             },
+            "requested_max_tokens": int(max_tokens),
             # Keep original data for postprocessing
             "group_id": row["group_id"],
             "sample_id": row["sample_id"],
@@ -228,14 +182,36 @@ def make_preprocess_for_vllm(
 def postprocess_from_vllm(row: Dict[str, Any]) -> Dict[str, Any]:
     """Postprocess function after vLLM generation."""
     response = str(row.get("generated_text", ""))
-    # print('fafa', row)
-    
-    # Extract answer using utility function
-    extracted_answer = extract_answer(response) or ""
-    
-    # Check if answer is correct using utility function (rule-based)
-    expected = str(row.get("expected_answer", "")).strip()
-    passed = compare_answers(extracted_answer, expected)
+    prompt_token_ids_b64, prompt_token_count = encode_token_ids(
+        row.get("prompt_token_ids"), "prompt_token_ids"
+    )
+    response_token_ids_b64, response_token_count = encode_token_ids(
+        row.get("generated_tokens"), "generated_tokens"
+    )
+    reported_response_tokens = row.get("num_generated_tokens")
+    if (
+        reported_response_tokens is not None
+        and int(reported_response_tokens) != response_token_count
+    ):
+        raise ValueError(
+            "Ray/vLLM returned inconsistent generated token counts: "
+            f"reported={reported_response_tokens}, actual={response_token_count}"
+        )
+    requested_max_tokens = int(row.get("requested_max_tokens", 0))
+    if requested_max_tokens <= 0:
+        raise ValueError("requested_max_tokens must be present and positive")
+    if response_token_count > requested_max_tokens:
+        raise ValueError(
+            f"vLLM returned {response_token_count} tokens with max_tokens="
+            f"{requested_max_tokens}"
+        )
+
+    finish_reason = row.get("finish_reason")
+    stop_reason = row.get("stop_reason")
+    if finish_reason is not None:
+        finish_reason = str(finish_reason)
+    if stop_reason is not None:
+        stop_reason = str(stop_reason)
     
     return {
         "data_source": row["data_source"],
@@ -245,10 +221,18 @@ def postprocess_from_vllm(row: Dict[str, Any]) -> Dict[str, Any]:
         "msg": row["msg"],
         "expected_answer": row["expected_answer"],
         "response": response,
-        "extracted_answer": extracted_answer,
-        "passed": passed,
-        # Keep legacy field for downstream compatibility
-        "is_correct": passed,
+        "token_schema_version": TOKEN_SCHEMA_VERSION,
+        "token_ids_encoding": TOKEN_IDS_ENCODING,
+        "prompt_token_ids_b64": prompt_token_ids_b64,
+        "response_token_ids_b64": response_token_ids_b64,
+        "prompt_token_count": prompt_token_count,
+        "response_token_count": response_token_count,
+        "requested_max_tokens": requested_max_tokens,
+        "generation_hit_max_tokens": response_token_count == requested_max_tokens,
+        # Ray 2.44.1 does not expose these vLLM fields, but retain them when a
+        # newer processor supplies them. Exact generated length is always kept.
+        "generation_finish_reason": finish_reason,
+        "generation_stop_reason": stop_reason,
         "generation_time": 0,  # Will be calculated later
         "original_data": row["original_data"]
     }
@@ -297,7 +281,36 @@ def calculate_accuracy(results: List[Dict]) -> Dict:
     }
 
 
-def save_results(results: List[Dict], output_dir: str, metadata: Optional[Dict] = None):
+def apply_unified_reward(
+    responses_file: str,
+    reward_path: str,
+    reward_name: str,
+    manifest_path: Optional[str] = None,
+) -> List[Dict]:
+    """Apply the shared VERL-compatible reward to saved responses."""
+    cmd = [
+        sys.executable,
+        SCORE_RESPONSES_SCRIPT,
+        "--responses_file",
+        responses_file,
+        "--reward_path",
+        reward_path,
+        "--reward_name",
+        reward_name,
+    ]
+    if manifest_path:
+        cmd.extend(["--manifest_path", manifest_path])
+
+    print("Applying unified reward:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    with open(responses_file, "r", encoding="utf-8") as handle:
+        scored_results = json.load(handle)
+    if not isinstance(scored_results, list):
+        raise TypeError(f"Expected a JSON list after reward scoring: {responses_file}")
+    return scored_results
+
+
+def save_results(results: List[Dict], output_dir: str):
     """Save results to output directory."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -306,23 +319,8 @@ def save_results(results: List[Dict], output_dir: str, metadata: Optional[Dict] 
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
-    # Save metadata
-    if metadata is None:
-        metadata = {}
-    
-    metadata.update({
-        'timestamp': datetime.now().isoformat(),
-        'num_responses': len(results),
-        'output_dir': output_dir
-    })
-    
-    metadata_file = os.path.join(output_dir, 'metadata.json')
-    with open(metadata_file, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
     print(f"Results saved to: {output_dir}")
     print(f"  - Responses: {results_file}")
-    print(f"  - Metadata: {metadata_file}")
 
 
 def main():
@@ -361,10 +359,12 @@ def main():
                        help="HF repo id or local path to tokenizer (defaults to model_path)")
     parser.add_argument("--chat_template", type=str, default=None,
                        help="Optional chat template to apply in preprocess")
-    parser.add_argument("--use_model_judge", action="store_true", default=False,
-                       help="Use model judge for responses that fail rule-based checks")
-    parser.add_argument("--model_judge_concurrency", type=int, default=3096,
-                       help="Maximum number of concurrent model-judge requests")
+    parser.add_argument("--reward_path", type=str, default=DEFAULT_REWARD_PATH,
+                        help="VERL-compatible custom reward Python file")
+    parser.add_argument("--reward_name", type=str, default="compute_score",
+                        help="Callable name inside the custom reward module")
+    parser.add_argument("--reward_manifest_path", type=str, default=None,
+                        help="Optional reward_scoring.json output path")
     
     args = parser.parse_args()
     
@@ -459,11 +459,15 @@ def main():
     for result in results:
         result['generation_time'] = avg_time
     
-    if args.use_model_judge:
-        print("\nRunning model judge fallback on unmatched responses...")
-        # updated = run_model_judge(results, args.model_judge_concurrency)
-        updated = run_model_judge(results, 4096)
-        print(f"Model judge marked {updated} additional responses as passed.")
+    # Persist the exact engine tokens first, then use the shared reward adapter.
+    save_results(results, args.output_dir)
+    responses_file = os.path.join(args.output_dir, "responses.json")
+    results = apply_unified_reward(
+        responses_file=responses_file,
+        reward_path=args.reward_path,
+        reward_name=args.reward_name,
+        manifest_path=args.reward_manifest_path,
+    )
 
     # Calculate accuracy
     accuracy_metrics = calculate_accuracy(results)
@@ -477,27 +481,6 @@ def main():
     sample_groups = dict(list(accuracy_metrics['group_accuracy_rates'].items())[:10])
     print(f"Sample Group Accuracy: {sample_groups}")
     
-    # Save results
-    metadata = {
-        'model_path': args.model_path,
-        'prompts_file': args.prompts_file,
-        'n_samples': args.n_samples,
-        'max_problems': args.max_problems,
-        'temperature': args.temperature,
-        'max_tokens': args.max_tokens,
-        'tensor_parallel_size': args.tensor_parallel_size,
-        'pipeline_parallel_size': args.pipeline_parallel_size,
-        'concurrency': args.concurrency,
-        'batch_size': args.batch_size,
-        'max_model_len': args.max_model_len,
-        'gpu_memory_utilization': args.gpu_memory_utilization,
-        'accuracy_metrics': accuracy_metrics,
-        'ray_version': ray.__version__,
-        'generation_time': generation_time,
-        'model_judge_used': args.use_model_judge,
-    }
-    
-    save_results(results, args.output_dir, metadata)
     print("Ray Data batch inference completed successfully!")
     
     # Shutdown Ray
@@ -505,4 +488,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

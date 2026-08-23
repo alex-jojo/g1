@@ -11,14 +11,18 @@ import os
 import sys
 import time
 import asyncio
+import subprocess
 from typing import List, Dict
-from datetime import datetime
 from openai import AsyncOpenAI
 import aiohttp
 
-# Add parent directory to path to import utils
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import compare_answers, extract_answer
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_REWARD_PATH = os.path.join(
+    REPO_ROOT, "rewards", "grpo_math_verify_reward.py"
+)
+SCORE_RESPONSES_SCRIPT = os.path.join(
+    REPO_ROOT, "automated", "score_responses.py"
+)
 
 
 def load_training_data(data_path: str, max_samples: int = 1000) -> List[Dict]:
@@ -39,6 +43,7 @@ def load_training_data(data_path: str, max_samples: int = 1000) -> List[Dict]:
                 data.append({
                     "problem": entry['prompt'][0]['content'],
                     "answer": entry['reward_model']['ground_truth'],
+                    "data_source": entry.get("data_source", ""),
                     "original_entry": entry  # Keep original for reference
                 })
     
@@ -94,6 +99,7 @@ def load_prompts_from_file(prompts_file: str, max_samples: int = None) -> List[D
                         data.append({
                             "problem": problem,
                             "answer": answer,
+                            "data_source": entry.get("data_source", ""),
                             "original_entry": entry
                         })
     else:
@@ -130,10 +136,16 @@ def create_prompts_from_data(data: List[Dict], n_samples_per_prompt: int = 5) ->
             # Generic format
             prompt = str(item)
             expected_answer = ''
+
+        original_entry = item.get("original_entry", item)
+        data_source = item.get("data_source", "")
+        if not data_source and isinstance(original_entry, dict):
+            data_source = original_entry.get("data_source", "")
         
         # Create multiple copies for group sampling
         for sample_idx in range(n_samples_per_prompt):
             prompts_data.append({
+                'data_source': data_source,
                 'group_id': group_idx,
                 'sample_id': sample_idx,
                 'prompt': prompt,
@@ -256,34 +268,14 @@ async def generate_responses_client(
     return results
 
 
-def extract_answer_from_response(response: str) -> str:
-    """Extract the final answer from a response string using utility function."""
-    return extract_answer(response)
-
-
 def calculate_accuracy(responses_data: List[Dict]) -> Dict:
-    """Calculate accuracy metrics for the generated responses."""
+    """Calculate accuracy from the unified reward fields."""
     total_responses = len(responses_data)
     correct_responses = 0
     group_accuracy = {}
     
     for item in responses_data:
-        expected = str(item['expected_answer']).strip()
-        response = item['response']
-        
-        # Skip error responses
-        if response.startswith("ERROR:"):
-            continue
-        
-        # Extract answer from response using utility function
-        extracted_answer = extract_answer_from_response(response)
-        
-        # Check if answer is correct using utility function
-        is_correct = compare_answers(extracted_answer, expected)
-        
-        # Store results
-        item['extracted_answer'] = extracted_answer
-        item['is_correct'] = is_correct
+        is_correct = bool(item.get('passed', item.get('is_correct', False)))
         
         if is_correct:
             correct_responses += 1
@@ -324,7 +316,36 @@ def calculate_accuracy(responses_data: List[Dict]) -> Dict:
     }
 
 
-def save_results(results: List[Dict], output_dir: str, metadata: Dict = None):
+def apply_unified_reward(
+    responses_file: str,
+    reward_path: str,
+    reward_name: str,
+    manifest_path: str | None = None,
+) -> List[Dict]:
+    """Apply the same reward adapter used by SVD analysis to saved responses."""
+    cmd = [
+        sys.executable,
+        SCORE_RESPONSES_SCRIPT,
+        "--responses_file",
+        responses_file,
+        "--reward_path",
+        reward_path,
+        "--reward_name",
+        reward_name,
+    ]
+    if manifest_path:
+        cmd.extend(["--manifest_path", manifest_path])
+
+    print("Applying unified reward:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    with open(responses_file, "r", encoding="utf-8") as handle:
+        scored_results = json.load(handle)
+    if not isinstance(scored_results, list):
+        raise TypeError(f"Expected a JSON list after reward scoring: {responses_file}")
+    return scored_results
+
+
+def save_results(results: List[Dict], output_dir: str):
     """Save results to output directory."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -333,23 +354,8 @@ def save_results(results: List[Dict], output_dir: str, metadata: Dict = None):
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
-    # Save metadata
-    if metadata is None:
-        metadata = {}
-    
-    metadata.update({
-        'timestamp': datetime.now().isoformat(),
-        'num_responses': len(results),
-        'output_dir': output_dir
-    })
-    
-    metadata_file = os.path.join(output_dir, 'metadata.json')
-    with open(metadata_file, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
     print(f"Results saved to: {output_dir}")
     print(f"  - Responses: {results_file}")
-    print(f"  - Metadata: {metadata_file}")
 
 
 async def main_async():
@@ -373,7 +379,13 @@ async def main_async():
     parser.add_argument("--batch_size", type=int, default=32,
                        help="Batch size for API requests")
     parser.add_argument("--max_concurrent", type=int, default=10,
-                       help="Maximum concurrent requests")
+                        help="Maximum concurrent requests")
+    parser.add_argument("--reward_path", type=str, default=DEFAULT_REWARD_PATH,
+                        help="VERL-compatible custom reward Python file")
+    parser.add_argument("--reward_name", type=str, default="compute_score",
+                        help="Callable name inside the custom reward module")
+    parser.add_argument("--reward_manifest_path", type=str, default=None,
+                        help="Optional reward_scoring.json output path")
     
     args = parser.parse_args()
     
@@ -397,7 +409,17 @@ async def main_async():
         max_concurrent=args.max_concurrent
     )
     
-    # Calculate accuracy
+    # Save raw responses, then apply exactly the same reward adapter used by SVD.
+    save_results(results, args.output_dir)
+    responses_file = os.path.join(args.output_dir, 'responses.json')
+    results = apply_unified_reward(
+        responses_file=responses_file,
+        reward_path=args.reward_path,
+        reward_name=args.reward_name,
+        manifest_path=args.reward_manifest_path,
+    )
+
+    # Calculate accuracy from unified reward results.
     accuracy_metrics = calculate_accuracy(results)
     print("\nAccuracy Metrics:")
     print(f"Overall Accuracy: {accuracy_metrics['overall_accuracy']:.2%}")
@@ -409,21 +431,6 @@ async def main_async():
     sample_groups = dict(list(accuracy_metrics['group_accuracy_rates'].items())[:10])
     print(f"Sample Group Accuracy: {sample_groups}")
     
-    # Save results
-    metadata = {
-        'server_url': args.server_url,
-        'model_name': args.model_name,
-        'prompts_file': args.prompts_file,
-        'n_samples': args.n_samples,
-        'max_problems': args.max_problems,
-        'temperature': args.temperature,
-        'max_tokens': args.max_tokens,
-        'batch_size': args.batch_size,
-        'max_concurrent': args.max_concurrent,
-        'accuracy_metrics': accuracy_metrics
-    }
-    
-    save_results(results, args.output_dir, metadata)
     print("Inference completed successfully!")
 
 
@@ -433,4 +440,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

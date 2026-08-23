@@ -42,6 +42,8 @@ from tqdm import tqdm
 import numpy as np
 import os
 import json
+import math
+import re
 from collections import defaultdict
 from time import time
 import torch.distributed as dist
@@ -165,6 +167,7 @@ class GRPOGradientAnalyzerParallel:
         optimizer_state_path: Optional[str] = None,
         optimizer_epsilon: float = 1e-8,
         mode: str = 'sim',
+        svd_rank: int = 128,
     ):
         """
         Initialize parallel GRPO gradient analyzer.
@@ -208,6 +211,9 @@ class GRPOGradientAnalyzerParallel:
             raise ValueError("optimizer_state_path must be provided when use_optimizer is True")
         torch.set_printoptions(precision=10, threshold=5)
         self.mode = mode
+        self.svd_rank = svd_rank
+        if self.svd_rank <= 0:
+            raise ValueError("svd_rank must be positive")
 
         self.optimizer: Optional[Adam] = None
         self._name_to_param: Dict[str, torch.nn.Parameter] = {}
@@ -247,6 +253,15 @@ class GRPOGradientAnalyzerParallel:
         
         # Load and prepare models
         self._load_models()
+
+        # FSDP turns an original 2-D parameter into rank-local flat shards.
+        # Keep the original names and shapes so SVD mode can reconstruct one
+        # complete matrix at a time after backward.
+        self._parameter_shapes = {
+            self._sanitize_name(name): tuple(param.shape)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
         
         # Setup optimizer (needed for gradient computation structure)
         # self.optimizer = AdamW(self.model.parameters(), lr=learning_rate)
@@ -254,6 +269,19 @@ class GRPOGradientAnalyzerParallel:
         # Prepare with accelerator
         self.model = self.accelerator.prepare(self.model)
         # self.ref_model = self.accelerator.prepare(self.ref_model)
+
+        if self.mode == 'svd':
+            svd_matrix_count = len(self._svd_parameter_specs())
+            if svd_matrix_count == 0:
+                raise ValueError(
+                    "SVD mode found no 2-D weight matrices inside transformer layers; "
+                    "check the model parameter naming convention"
+                )
+            if self.accelerator.is_main_process:
+                logger.info(
+                    f"SVD mode will analyze {svd_matrix_count} transformer-layer "
+                    f"matrices per question (top {self.svd_rank})"
+                )
 
         if self.use_optimizer:
             self._setup_optimizer()
@@ -430,10 +458,39 @@ class GRPOGradientAnalyzerParallel:
         
         if self.accelerator.is_main_process:
             print(f"Process {self.accelerator.process_index} handling {len(data_per_process)} samples")
-        
-        total_loss = 0.0
-        num_batches = 0
-        
+
+        # ``compute_policy_loss`` returns a token mean for each mini-batch.  To
+        # make gradient accumulation invariant to how a question is split into
+        # mini-batches, weight every local mini-batch by its fraction of all
+        # valid response tokens across all data-parallel ranks.
+        #
+        # Each stored response mask has already been shifted once by
+        # ``create_response_mask``; the loss path applies a second shift below,
+        # so mirror that shift when counting tokens here.
+        local_response_tokens = sum(
+            int(item['response_mask'][..., 1:].sum().item())
+            for item in data_per_process
+        )
+        local_response_tokens_tensor = torch.tensor(
+            float(local_response_tokens),
+            device=self.accelerator.device,
+            dtype=torch.float32,
+        )
+        global_response_tokens = self.accelerator.reduce(
+            local_response_tokens_tensor,
+            reduction="sum",
+        )
+        if global_response_tokens.item() <= 0:
+            raise ValueError("Cannot compute gradients: batch has no valid response tokens")
+
+        if self.accelerator.is_main_process:
+            print(f"Global valid response tokens: {int(global_response_tokens.item())}")
+
+        total_loss_numerator = torch.tensor(
+            0.0,
+            device=self.accelerator.device,
+            dtype=torch.float32,
+        )
         # Process local data in mini-batches
         # print("len", len(data_per_process))
         for i in range(0, len(data_per_process), self.mini_batch_size):
@@ -466,14 +523,25 @@ class GRPOGradientAnalyzerParallel:
                 old_log_probs, new_log_probs, advantages_expanded, response_mask, self.clip_ratio, 
                 self.accelerator
             )
-            
-            # Total loss for this batch (don't scale by num_processes here since we want to aggregate)
-            batch_loss = policy_loss * 8
-            
-            # Accumulate loss
-            total_loss += batch_loss.item()
-            num_batches += 1
-            
+
+            mini_batch_tokens = response_mask.sum(dtype=torch.float32)
+            if mini_batch_tokens.item() <= 0:
+                raise ValueError("Cannot compute gradients: mini-batch has no valid response tokens")
+
+            # FSDP averages gradients across data-parallel ranks. Multiplying
+            # by num_processes cancels that average, while the token fraction
+            # makes the accumulated gradient exactly the global token mean:
+            #   sum_b (tokens_b / total_tokens) * grad(mean_loss_b).
+            token_fraction = mini_batch_tokens / global_response_tokens
+            batch_loss = (
+                policy_loss
+                * token_fraction.to(dtype=policy_loss.dtype)
+                * self.accelerator.num_processes
+            )
+
+            # Track the unscaled token-loss numerator for meaningful logging.
+            total_loss_numerator += policy_loss.detach().to(torch.float32) * mini_batch_tokens.detach()
+
             # Backward pass to accumulate gradients
             self.accelerator.backward(batch_loss)
             # print('batch_loss', batch_loss)
@@ -491,24 +559,12 @@ class GRPOGradientAnalyzerParallel:
             # pprint(self.optimizer.state_dict())
             # print('optimizer after step', self.optimizer.state_dict())
         
-        # Aggregate loss across all processes
-        if num_batches > 0:
-            avg_loss = total_loss / num_batches
-        else:
-            avg_loss = 0.0
-        
-        # Reduce loss across all processes
-        avg_loss_tensor = torch.tensor(avg_loss, device=self.accelerator.device)
-        total_batches_tensor = torch.tensor(num_batches, device=self.accelerator.device)
-        
-        avg_loss_tensor = self.accelerator.reduce(avg_loss_tensor, reduction="sum")
-        total_batches_tensor = self.accelerator.reduce(total_batches_tensor, reduction="sum")
-        # print('Total batches', total_batches_tensor)
-        
-        if total_batches_tensor > 0:
-            global_avg_loss = (avg_loss_tensor / total_batches_tensor).item()
-        else:
-            global_avg_loss = 0.0
+        # Report the same global token-mean loss whose gradient was computed.
+        global_loss_numerator = self.accelerator.reduce(
+            total_loss_numerator,
+            reduction="sum",
+        )
+        global_avg_loss = (global_loss_numerator / global_response_tokens).item()
         
         # Extract and aggregate gradients across all processes
         gradients: Dict[str, torch.Tensor] = {}
@@ -589,6 +645,275 @@ class GRPOGradientAnalyzerParallel:
             print(f"Cosine similarity computation time: {time() - start_time:.2f}s")
         
         return dot_product.item(), distribution
+
+    @staticmethod
+    def _is_transformer_layer_matrix(name: str, shape: Tuple[int, ...]) -> bool:
+        """Return whether a parameter is a 2-D weight inside a transformer block."""
+        if len(shape) != 2 or not name.endswith(".weight"):
+            return False
+        return re.search(r"(?:^|\.)(?:layers|h|blocks|block)\.\d+(?:\.|$)", name) is not None
+
+    def _svd_parameter_specs(self) -> List[Tuple[str, Tuple[int, int]]]:
+        """Return a deterministic list of transformer-layer matrices to analyze."""
+        return [
+            (name, shape)
+            for name, shape in sorted(self._parameter_shapes.items())
+            if self._is_transformer_layer_matrix(name, shape)
+        ]
+
+    def _gather_full_gradient_matrix(
+        self,
+        local_gradient: Optional[torch.Tensor],
+        parameter_name: str,
+        original_shape: Tuple[int, int],
+    ) -> Optional[torch.Tensor]:
+        """Reconstruct one original FSDP gradient matrix on the main rank."""
+        device = self.accelerator.device
+        if local_gradient is None:
+            local_flat = torch.empty(0, device=device, dtype=torch.float32)
+        else:
+            local_flat = local_gradient.detach().reshape(-1).to(
+                device=device,
+                dtype=torch.float32,
+            )
+
+        if self.accelerator.num_processes == 1:
+            if not self.accelerator.is_main_process:
+                return None
+            expected_numel = math.prod(original_shape)
+            if local_flat.numel() != expected_numel:
+                raise RuntimeError(
+                    f"Cannot reconstruct gradient for {parameter_name}: "
+                    f"found {local_flat.numel()} values, expected {expected_numel} "
+                    f"for shape {original_shape}"
+                )
+            return local_flat.reshape(original_shape)
+
+        local_size = torch.tensor([local_flat.numel()], device=device, dtype=torch.long)
+        gathered_sizes = [torch.zeros_like(local_size) for _ in range(self.accelerator.num_processes)]
+        dist.all_gather(gathered_sizes, local_size)
+        sizes = [int(size.item()) for size in gathered_sizes]
+        max_size = max(sizes)
+
+        padded = torch.zeros(max_size, device=device, dtype=torch.float32)
+        if local_flat.numel() > 0:
+            padded[:local_flat.numel()].copy_(local_flat)
+        gathered_shards = [torch.empty_like(padded) for _ in range(self.accelerator.num_processes)]
+        dist.all_gather(gathered_shards, padded)
+
+        if not self.accelerator.is_main_process:
+            return None
+
+        full_flat = torch.cat([
+            shard[:shard_size]
+            for shard, shard_size in zip(gathered_shards, sizes)
+            if shard_size > 0
+        ])
+        expected_numel = math.prod(original_shape)
+        if full_flat.numel() != expected_numel:
+            raise RuntimeError(
+                f"Cannot reconstruct gradient for {parameter_name}: "
+                f"gathered {full_flat.numel()} values, expected {expected_numel} "
+                f"for shape {original_shape}; local shard sizes={sizes}"
+            )
+        return full_flat.reshape(original_shape)
+
+    def compute_svd_distributed(
+        self,
+        gradients: Dict[str, torch.Tensor],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Compute and retain only the leading singular values of each layer matrix."""
+        gradients_by_name = {
+            self._sanitize_name(name): gradient
+            for name, gradient in gradients.items()
+        }
+        parameter_specs = self._svd_parameter_specs()
+        results: Dict[str, Dict[str, Any]] = {}
+
+        if self.accelerator.is_main_process:
+            print(
+                f"Running truncated SVD for {len(parameter_specs)} transformer-layer "
+                f"gradient matrices (top {self.svd_rank})"
+            )
+
+        for parameter_name, original_shape in parameter_specs:
+            matrix = self._gather_full_gradient_matrix(
+                gradients_by_name.get(parameter_name),
+                parameter_name,
+                original_shape,
+            )
+            if not self.accelerator.is_main_process:
+                continue
+
+            target_rank = min(self.svd_rank, min(original_shape))
+            # Oversampling improves the randomized top-k approximation while
+            # still avoiding a full SVD. Only target_rank values are retained.
+            lowrank_q = min(target_rank + 8, min(original_shape))
+            # svd_lowrank is randomized. Fork and restore RNG state so this
+            # analysis never changes dropout/randomness in the next question.
+            rng_devices = [matrix.device.index] if matrix.is_cuda else []
+            with torch.random.fork_rng(devices=rng_devices):
+                if matrix.is_cuda:
+                    torch.cuda.manual_seed(0)
+                else:
+                    torch.manual_seed(0)
+                _, singular_values, _ = torch.svd_lowrank(
+                    matrix,
+                    q=lowrank_q,
+                    niter=2,
+                )
+            singular_values = torch.sort(singular_values, descending=True).values[:target_rank]
+            singular_values_cpu = singular_values.cpu()
+            results[parameter_name] = {
+                "shape": list(original_shape),
+                "num_singular_values": target_rank,
+                "singular_values": singular_values_cpu.tolist(),
+                # Singular values are non-negative, so this is also the
+                # absolute-value sum. It is a top-k/Ky Fan norm, not the full
+                # nuclear norm when target_rank < min(original_shape).
+                "topk_singular_value_sum": float(singular_values_cpu.sum().item()),
+            }
+            del matrix, singular_values, singular_values_cpu
+
+        return results
+
+    def _zero_svd_results(self) -> Dict[str, Dict[str, Any]]:
+        """Materialize the exact all-zero spectrum for a zero-advantage group."""
+        if not self.accelerator.is_main_process:
+            return {}
+        return {
+            parameter_name: {
+                "shape": list(original_shape),
+                "num_singular_values": min(self.svd_rank, min(original_shape)),
+                "singular_values": [0.0] * min(self.svd_rank, min(original_shape)),
+                "topk_singular_value_sum": 0.0,
+            }
+            for parameter_name, original_shape in self._svd_parameter_specs()
+        }
+
+    @staticmethod
+    def _effective_rank_from_singular_values(singular_values: List[float]) -> float:
+        """Compute exp(entropy) from one matrix's saved top-k singular values."""
+        values = [float(value) for value in singular_values]
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ValueError("Singular values must be finite and non-negative")
+
+        singular_value_sum = math.fsum(values)
+        # A zero GRPO gradient has no normalized singular-value distribution.
+        # Use the explicit convention requested for this analysis: R = 0.
+        if singular_value_sum == 0.0:
+            return 0.0
+
+        probabilities = [
+            value / singular_value_sum
+            for value in values
+            if value > 0.0
+        ]
+        entropy = -math.fsum(
+            probability * math.log(probability)
+            for probability in probabilities
+        )
+        return math.exp(entropy)
+
+    def compute_effective_rank_score(
+        self,
+        svd_results: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Aggregate top-k effective ranks over layers and Q/K/V/O projections."""
+        projection_labels = {
+            "q_proj": "Q",
+            "k_proj": "K",
+            "v_proj": "V",
+            "o_proj": "O",
+        }
+        per_projection_layers: Dict[str, Dict[int, float]] = {
+            label: {} for label in projection_labels.values()
+        }
+        attention_pattern = re.compile(
+            r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)\."
+            r".*?self_attn\.(q_proj|k_proj|v_proj|o_proj)\.weight$"
+        )
+
+        for parameter_name, matrix_result in svd_results.items():
+            match = attention_pattern.search(parameter_name)
+            if match is None:
+                continue
+
+            layer_index = int(match.group(1))
+            projection_label = projection_labels[match.group(2)]
+            if layer_index in per_projection_layers[projection_label]:
+                raise RuntimeError(
+                    f"Duplicate {projection_label} projection gradient for layer {layer_index}"
+                )
+
+            effective_rank = self._effective_rank_from_singular_values(
+                matrix_result["singular_values"]
+            )
+            matrix_result["topk_effective_rank"] = effective_rank
+            per_projection_layers[projection_label][layer_index] = effective_rank
+
+        missing_projections = [
+            label
+            for label, layer_values in per_projection_layers.items()
+            if not layer_values
+        ]
+        if missing_projections:
+            raise RuntimeError(
+                "Cannot compute effective-rank score: no layer matrices found for "
+                + ", ".join(missing_projections)
+            )
+
+        layer_counts = {
+            label: len(layer_values)
+            for label, layer_values in per_projection_layers.items()
+        }
+        if len(set(layer_counts.values())) != 1:
+            raise RuntimeError(
+                f"Cannot compute effective-rank score with unequal Q/K/V/O layer counts: {layer_counts}"
+            )
+
+        projection_sums = {
+            label: math.fsum(layer_values.values())
+            for label, layer_values in per_projection_layers.items()
+        }
+        final_score = math.fsum(projection_sums.values())
+        return {
+            "k": self.svd_rank,
+            "zero_spectrum_effective_rank": 0.0,
+            "aggregation": "sum_layers_then_equal_sum_qkvo",
+            "per_projection_layer_count": layer_counts,
+            "per_projection_layer_sum": projection_sums,
+            "s": final_score,
+        }
+
+    def save_svd_result_incrementally(
+        self,
+        group_id: int,
+        loss: float,
+        svd_results: Dict[str, Dict[str, Any]],
+        output_path: str,
+        zero_advantage: bool = False,
+    ) -> None:
+        """Append one question's per-matrix truncated SVD result to JSONL."""
+        if not self.accelerator.is_main_process:
+            return
+        effective_rank_score = self.compute_effective_rank_score(svd_results)
+        result = {
+            "group_id": group_id,
+            "loss": loss,
+            "zero_advantage": zero_advantage,
+            "svd_rank": self.svd_rank,
+            "svd_method": "torch.svd_lowrank",
+            "svd_niter": 2,
+            "svd_seed": 0,
+            "matrices": svd_results,
+            "effective_rank_topk": effective_rank_score,
+            "timestamp": time(),
+        }
+        with open(output_path, "a") as output_file:
+            output_file.write(json.dumps(result) + "\n")
+            output_file.flush()
+        print(f"Saved top-{self.svd_rank} SVD result for group {group_id} to {output_path}")
     
     def save_result_incrementally(self, group_id: int, similarity: float, loss: float, output_path: str, distribution: Optional[Dict[str, float]] = None):
         """Save a single group's result to the JSONL files.
@@ -662,9 +987,12 @@ class GRPOGradientAnalyzerParallel:
         
         # Step 1: Compute validation gradients using all GPUs
         if self.accelerator.is_main_process:
-            print("Computing validation gradients using all GPUs...")
+            if self.mode == 'svd':
+                print("SVD mode: validation gradient and cosine alignment are disabled")
+            else:
+                print("Computing validation gradients using all GPUs...")
 
-        if self.mode !='norm':
+        if self.mode not in {'norm', 'svd'}:
             if norm_before_accumlation and self.mode != 'dot':
                 cnt = 0
                 val_gradients = {}
@@ -744,15 +1072,24 @@ class GRPOGradientAnalyzerParallel:
             # print(str(self.accelerator.process_index) + " " + str(zero_advantage))
             if zero_advantage:# and False:
                 if self.accelerator.is_main_process:
-                    print(f"Skipping group {group_id} because all advantages are 0")
+                    print(f"Group {group_id} has all-zero advantages")
                 group_loss = 0.0
                 similarity = 0.0
                 distribution = {}
+                svd_results = self._zero_svd_results() if self.mode == 'svd' else {}
             else:
-                group_loss, group_gradients, norm_sq = self.compute_loss_and_gradients_distributed(group_data, perform_norm=(self.mode != 'dot'))
+                group_loss, group_gradients, norm_sq = self.compute_loss_and_gradients_distributed(
+                    group_data,
+                    scale_with_optimizer=(self.use_optimizer and self.mode != 'svd'),
+                    perform_norm=(self.mode not in {'dot', 'svd'}),
+                )
                 
                 # Compute global dot product and per-module distribution
-                if self.mode !='norm':
+                if self.mode == 'svd':
+                    svd_results = self.compute_svd_distributed(group_gradients)
+                    similarity = 0.0
+                    distribution = {}
+                elif self.mode !='norm':
                     similarity, distribution = self.compute_cosine_similarity_distributed(val_gradients, group_gradients)
                 else:
                     similarity = norm_sq
@@ -760,11 +1097,23 @@ class GRPOGradientAnalyzerParallel:
             # Only main process collects, prints, and saves results
             if self.accelerator.is_main_process:
                 all_similarities[group_id] = similarity
-                print(f"Group {group_id}: loss={group_loss:.4f}, similarity={similarity:.4f}")
+                if self.mode == 'svd':
+                    print(f"Group {group_id}: loss={group_loss:.4f}, matrices={len(svd_results)}")
+                else:
+                    print(f"Group {group_id}: loss={group_loss:.4f}, similarity={similarity:.4f}")
                 
                 # Save result incrementally if output path is provided
                 if output_path:
-                    self.save_result_incrementally(group_id, similarity, group_loss, output_path, distribution)
+                    if self.mode == 'svd':
+                        self.save_svd_result_incrementally(
+                            group_id,
+                            group_loss,
+                            svd_results,
+                            output_path,
+                            zero_advantage=zero_advantage,
+                        )
+                    else:
+                        self.save_result_incrementally(group_id, similarity, group_loss, output_path, distribution)
             
             # Synchronize all processes before moving to next group
             self.accelerator.wait_for_everyone()
@@ -943,4 +1292,4 @@ class GRPOGradientAnalyzerParallel:
 
 
 # Alias for backward compatibility
-GRPOTrainerParallel = GRPOGradientAnalyzerParallel 
+GRPOTrainerParallel = GRPOGradientAnalyzerParallel

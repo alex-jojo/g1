@@ -14,7 +14,6 @@ import sys
 from typing import List, Dict
 from vllm import LLM, SamplingParams
 import time
-from datetime import datetime
 
 # Add parent directory to path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -323,7 +322,7 @@ def calculate_accuracy(responses_data: List[Dict]) -> Dict:
     }
 
 
-def save_results(results: List[Dict], output_dir: str, metadata: Dict = None):
+def save_results(results: List[Dict], output_dir: str):
     """Save results to output directory."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -332,23 +331,8 @@ def save_results(results: List[Dict], output_dir: str, metadata: Dict = None):
     with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
-    # Save metadata
-    if metadata is None:
-        metadata = {}
-    
-    metadata.update({
-        'timestamp': datetime.now().isoformat(),
-        'num_responses': len(results),
-        'output_dir': output_dir
-    })
-    
-    metadata_file = os.path.join(output_dir, 'metadata.json')
-    with open(metadata_file, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
     print(f"Results saved to: {output_dir}")
     print(f"  - Responses: {results_file}")
-    print(f"  - Metadata: {metadata_file}")
 
 
 def main():
@@ -414,24 +398,9 @@ def main():
     print(f"Sample Group Accuracy: {sample_groups}")
     
     # Save results
-    metadata = {
-        'model_path': args.model_path,
-        'prompts_file': args.prompts_file,
-        'n_samples': args.n_samples,
-        'max_problems': args.max_problems,
-        'temperature': args.temperature,
-        'max_tokens': args.max_tokens,
-        'tensor_parallel_size': args.tensor_parallel_size,
-        'pipeline_parallel_size': args.pipeline_parallel_size,
-        # 'data_parallel_size': args.data_parallel_size,
-        'batch_size': args.batch_size,
-        'enable_problem_batching': args.enable_problem_batching,
-        'accuracy_metrics': accuracy_metrics
-    }
-    
-    save_results(results, args.output_dir, metadata)
+    save_results(results, args.output_dir)
     print("Inference completed successfully!")
 
 
 if __name__ == "__main__":
-    main() 
+    main()

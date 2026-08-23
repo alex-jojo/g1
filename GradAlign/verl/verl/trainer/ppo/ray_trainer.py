@@ -356,7 +356,8 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("train_max_samples", -1),
             )
-        if val_dataset is None:
+        validation_enabled = bool(self.config.data.get("val_files"))
+        if validation_enabled and val_dataset is None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files,
                 self.config.data,
@@ -364,7 +365,8 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("val_max_samples", -1),
             )
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset if validation_enabled else None
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -384,26 +386,27 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
+        self.val_dataloader = None
+        if validation_enabled:
+            val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+            if val_batch_size is None:
+                val_batch_size = len(self.val_dataset)
 
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
 
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        if validation_enabled:
+            assert self.val_dataloader is not None and len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
-        print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
-        )
+        val_size = len(self.val_dataloader) if self.val_dataloader is not None else 0
+        print(f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: {val_size}")
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 

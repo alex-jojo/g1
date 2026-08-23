@@ -109,7 +109,7 @@ def load_dataset_responses(
     accelerator: Accelerator,
     ground_truth_map: Optional[Dict[int, Any]] = None,
     max_num_samples: Optional[int] = None,
-) -> Tuple[List[Any], List[str], List[int], List[str], List[bool]]:
+) -> Tuple[List[Any], List[str], List[int], List[str], List[float]]:
     """Load responses for a specific dataset (train or val)."""
     responses_file = os.path.join(responses_dir, f'responses_sorted.json')
     if not os.path.exists(responses_file):
@@ -125,7 +125,7 @@ def load_dataset_responses(
     responses = []
     group_indices = []
     expected_answers = []
-    passed_flags: List[bool] = []
+    reward_values: List[float] = []
     
     skipped_count = 0
     iterable = responses_data if max_num_samples is None else responses_data[:max_num_samples]
@@ -142,17 +142,23 @@ def load_dataset_responses(
         group_indices.append(group_id)
         # Get ground truth from problem set instead of stale response file
         expected_answers.append(ground_truth_map[group_id] if ground_truth_map else item['expected_answer'])
-        passed_value = item.get('passed')
-        if passed_value is None:
-            passed_value = item.get('is_correct', False)
-        passed_flags.append(bool(passed_value))
+        reward_value = item.get('reward_score')
+        if reward_value is None:
+            passed_value = item.get('passed')
+            if passed_value is None:
+                passed_value = item.get('is_correct', False)
+            reward_value = 1.0 if bool(passed_value) else 0.0
+        reward_value = float(reward_value)
+        if not np.isfinite(reward_value):
+            raise ValueError(f"Non-finite reward for group_id={group_id}: {reward_value}")
+        reward_values.append(reward_value)
     
     if accelerator.is_main_process:
         print(f"Loaded {len(responses)} {dataset_name} responses from {len(set(group_indices))} groups")
         if skipped_count > 0:
             print(f"Skipped {skipped_count} responses with missing expected_answer (likely removed by flip_label.py)")
     
-    return prompts, responses, group_indices, expected_answers, passed_flags
+    return prompts, responses, group_indices, expected_answers, reward_values
 
 
 def main():
@@ -161,8 +167,8 @@ def main():
                        help="Path to the model to analyze")
     parser.add_argument("--train_responses_dir", type=str, required=True,
                        help="Directory containing pre-generated train responses")
-    parser.add_argument("--val_responses_dir", type=str, required=True,
-                       help="Directory containing pre-generated validation responses")
+    parser.add_argument("--val_responses_dir", type=str, default=None,
+                       help="Directory containing validation responses (not used in svd mode)")
     parser.add_argument("--output_path", type=str, default="~/data_selection/data/analysis/gradient_similarities_parallel.jsonl",
                        help="Output JSONL file for incremental similarity results")
     parser.add_argument("--kl_loss_coef", type=float, default=0.001,
@@ -195,12 +201,18 @@ def main():
     parser.add_argument("--optimizer_state_path", type=str, default=None,
                        help="Path to converted optimizer state (required when --use_optimizer)")
     parser.add_argument("--mode", default='sim', type=str)
+    parser.add_argument("--svd_rank", default=128, type=int,
+                       help="Number of leading singular values saved per 2-D layer gradient in svd mode")
     args = parser.parse_args()
     # print('fa', args.norm_before_accumlation)
     # exit()
 
     if args.use_optimizer and not args.optimizer_state_path:
         parser.error("--optimizer_state_path must be provided when --use_optimizer is set")
+    if args.mode != 'svd' and not args.val_responses_dir:
+        parser.error("--val_responses_dir is required unless --mode svd is used")
+    if args.mode == 'svd' and args.use_optimizer:
+        parser.error("--use_optimizer is incompatible with --mode svd; SVD uses raw GRPO gradients")
 
     # Initialize a simple accelerator for process coordination (not for model sharding yet)
     temp_accelerator = Accelerator()
@@ -216,7 +228,7 @@ def main():
             print(f"Error: Train responses directory {args.train_responses_dir} does not exist!")
             sys.exit(1)
         
-        if not os.path.exists(args.val_responses_dir):
+        if args.mode != 'svd' and not os.path.exists(args.val_responses_dir):
             print(f"Error: Validation responses directory {args.val_responses_dir} does not exist!")
             sys.exit(1)
         
@@ -253,6 +265,7 @@ def main():
         use_optimizer=args.use_optimizer,
         optimizer_state_path=args.optimizer_state_path,
         mode=args.mode,
+        svd_rank=args.svd_rank,
     )
     
     # Use the analyzer's accelerator for subsequent operations
@@ -267,7 +280,7 @@ def main():
         train_responses,
         train_group_indices,
         train_expected_answers,
-        train_passed,
+        train_reward_values,
     ) = load_dataset_responses(
         args.train_responses_dir, "train", accelerator, ground_truth_map, max_num_samples=args.max_num_samples
     )
@@ -276,26 +289,29 @@ def main():
     train_responses_full = list(train_responses)
     train_group_indices_full = list(train_group_indices)
     train_expected_answers_full = list(train_expected_answers)
-    train_passed_full = list(train_passed)
+    train_reward_values_full = list(train_reward_values)
     
-    # Load validation responses
-    if accelerator.is_main_process:
-        print(f"\nLoading validation responses from: {args.val_responses_dir}")
-    
-    (
-        val_prompts,
-        val_responses,
-        val_group_indices,
-        val_expected_answers,
-        val_passed,
-    ) = load_dataset_responses(
-        args.val_responses_dir, "val", accelerator, max_num_samples=args.max_num_samples
-    )
-    val_prompts_full = list(val_prompts)
-    val_responses_full = list(val_responses)
-    val_group_indices_full = list(val_group_indices)
-    val_expected_answers_full = list(val_expected_answers)
-    val_passed_full = list(val_passed)
+    # SVD is a per-question analysis and does not need validation gradients.
+    if args.mode == 'svd':
+        val_responses_full = []
+        val_group_indices_full = []
+        val_reward_values_full = []
+    else:
+        if accelerator.is_main_process:
+            print(f"\nLoading validation responses from: {args.val_responses_dir}")
+
+        (
+            val_prompts,
+            val_responses,
+            val_group_indices,
+            val_expected_answers,
+            val_reward_values,
+        ) = load_dataset_responses(
+            args.val_responses_dir, "val", accelerator, max_num_samples=args.max_num_samples
+        )
+        val_responses_full = list(val_responses)
+        val_group_indices_full = list(val_group_indices)
+        val_reward_values_full = list(val_reward_values)
 
     # Filter out already processed training groups
     if processed_groups:
@@ -309,7 +325,7 @@ def main():
         train_responses = [r for i, r in enumerate(train_responses) if unprocessed_mask[i]]
         train_group_indices = [g for i, g in enumerate(train_group_indices) if unprocessed_mask[i]]
         train_expected_answers = [a for i, a in enumerate(train_expected_answers) if unprocessed_mask[i]]
-        train_passed = [v for i, v in enumerate(train_passed) if unprocessed_mask[i]]
+        train_reward_values = [v for i, v in enumerate(train_reward_values) if unprocessed_mask[i]]
         
         remaining_groups = set(train_group_indices)
         
@@ -319,7 +335,11 @@ def main():
         print(f"  Skipping {len(processed_groups)} already processed groups")
         
         if not train_prompts:
-            print("All training groups have been processed! Generating final summary...")
+            print("All training groups have been processed!")
+            if args.mode == 'svd':
+                print("SVD analysis complete!")
+                return
+            print("Generating final summary...")
             # Load all results for summary
             all_similarities = {}
             with open(args.output_path, 'r') as f:
@@ -332,18 +352,22 @@ def main():
             print("Analysis complete!")
             return
     
-    # Convert pass/fail flags into rewards for advantage computation
+    # Prefer the exact numeric reward returned by the shared custom reward.
+    # Legacy response files without reward_score fall back to 0/1 values.
     if accelerator.is_main_process:
-        print("\nComputing rewards from pass/fail signals...")
+        print("\nLoading numeric rewards for advantage computation...")
     
-    train_rewards_full = [1.0 if flag else 0.0 for flag in train_passed_full]
-    val_rewards_full = [1.0 if flag else 0.0 for flag in val_passed_full]
+    train_rewards_full = [float(value) for value in train_reward_values_full]
+    val_rewards_full = [float(value) for value in val_reward_values_full]
     
     if accelerator.is_main_process:
         print(f"Train: {len(train_responses_full)} responses from {len(set(train_group_indices_full))} groups")
-        print(f"Train pass rate - Mean: {np.mean(train_rewards_full):.3f}")
-        print(f"Val: {len(val_responses_full)} responses from {len(set(val_group_indices_full))} groups")
-        print(f"Val pass rate - Mean: {np.mean(val_rewards_full):.3f}")
+        train_pass_rate = np.mean([value > 0.0 for value in train_rewards_full])
+        print(f"Train reward - Mean: {np.mean(train_rewards_full):.3f}; pass rate: {train_pass_rate:.3f}")
+        if args.mode != 'svd':
+            print(f"Val: {len(val_responses_full)} responses from {len(set(val_group_indices_full))} groups")
+            val_pass_rate = np.mean([value > 0.0 for value in val_rewards_full])
+            print(f"Val reward - Mean: {np.mean(val_rewards_full):.3f}; pass rate: {val_pass_rate:.3f}")
     
     # Load pre-sharded prepared datasets instead of in-process tokenization
     if accelerator.is_main_process:
@@ -384,8 +408,15 @@ def main():
     rank = accelerator.process_index
     world_size = accelerator.num_processes
 
-    train_data = load_shard(args.train_responses_dir, world_size, rank)[:args.max_num_samples // world_size]
-    val_data = load_shard(args.val_responses_dir, world_size, rank)[:args.max_num_samples // world_size]
+    train_data = load_shard(args.train_responses_dir, world_size, rank)
+    if args.max_num_samples is not None:
+        train_data = train_data[:args.max_num_samples // world_size]
+    if args.mode == 'svd':
+        val_data = []
+    else:
+        val_data = load_shard(args.val_responses_dir, world_size, rank)
+        if args.max_num_samples is not None:
+            val_data = val_data[:args.max_num_samples // world_size]
 
     # Compute advantages on full datasets and attach by global_index
     train_advantages_full = compute_grpo_advantages(
@@ -393,11 +424,13 @@ def main():
         np.array(train_group_indices_full),
         False, 1e-6
     ).detach()
-    val_advantages_full = compute_grpo_advantages(
-        torch.tensor(val_rewards_full, dtype=torch.float32),
-        np.array(val_group_indices_full),
-        False, 1e-6
-    ).detach()
+    val_advantages_full = None
+    if args.mode != 'svd':
+        val_advantages_full = compute_grpo_advantages(
+            torch.tensor(val_rewards_full, dtype=torch.float32),
+            np.array(val_group_indices_full),
+            False, 1e-6
+        ).detach()
     # print('Len', len(train_data))
     # print('fa' + str([(entry['global_index'], entry['group_id']) for entry in train_data]))
 
@@ -434,8 +467,9 @@ def main():
         print("\nFinal memory usage:")
     analyzer.print_memory_stats()
     
-    # Generate final summary
-    if accelerator.is_main_process:
+    # Generate similarity summary only for alignment modes. SVD results are
+    # already self-contained, one JSON object per question.
+    if accelerator.is_main_process and args.mode != 'svd':
         # Load all results (including any previously processed ones)
         all_similarities = {}
         if os.path.exists(args.output_path):
@@ -460,6 +494,8 @@ def main():
                 print(f"  {i+1}. Group {group_id}: {similarity:.4f}")
         
         print(f"\nParallel gradient analysis completed! Results saved to: {args.output_path}")
+    elif accelerator.is_main_process:
+        print(f"\nParallel SVD analysis completed! Results saved to: {args.output_path}")
     
     # Clean up distributed resources
     try:
@@ -469,4 +505,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

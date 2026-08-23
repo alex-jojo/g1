@@ -96,7 +96,6 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     fsdp_transformer_layer_cls_to_wrap = _get_attr(
         "transformer_layer_cls_to_wrap", default_transformer_cls_names_to_wrap
     )
-    fsdp_transformer_layer_cls_to_wrap = ['Gemma3DecoderLayer']
     min_num_params = _get_attr("min_num_params", 0)
     auto_wrap_policy = None
 
