@@ -109,6 +109,30 @@ def truncated_svd(
     seed: int = 0,
 ) -> Dict[str, Any]:
     """Compute the same deterministic randomized top-k SVD used by FSDP mode."""
+    left, singular_values, right, frobenius_norm = truncated_svd_factors(
+        matrix,
+        svd_rank=svd_rank,
+        oversample=oversample,
+        niter=niter,
+        seed=seed,
+    )
+    result = summarize_svd(
+        matrix.shape,
+        singular_values,
+        frobenius_norm=frobenius_norm,
+    )
+    del left, right, singular_values
+    return result
+
+
+def truncated_svd_factors(
+    matrix: torch.Tensor,
+    svd_rank: int,
+    oversample: int = 8,
+    niter: int = 2,
+    seed: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Return aligned, descending top-k ``U, S, V`` factors and ||matrix||_F."""
     if matrix.ndim != 2:
         raise ValueError(f"Expected a 2-D matrix, found shape {tuple(matrix.shape)}")
     if svd_rank <= 0 or oversample < 0 or niter < 0:
@@ -130,9 +154,25 @@ def truncated_svd(
             q=lowrank_q,
             niter=niter,
         )
-    singular_values = torch.sort(singular_values, descending=True).values[:target_rank]
-    singular_values_cpu = singular_values.cpu()
+    order = torch.argsort(singular_values, descending=True)[:target_rank]
+    left = left.index_select(1, order)
+    singular_values = singular_values.index_select(0, order)
+    right = right.index_select(1, order)
     frobenius_norm = float(frobenius_norm_tensor.item())
+    del matrix_fp32, frobenius_norm_tensor, order
+    return left, singular_values, right, frobenius_norm
+
+
+def summarize_svd(
+    shape: Iterable[int],
+    singular_values: torch.Tensor,
+    *,
+    frobenius_norm: float,
+) -> Dict[str, Any]:
+    """Build the JSON-safe spectrum/statistics record from aligned SVD factors."""
+    original_shape = tuple(int(value) for value in shape)
+    singular_values_cpu = singular_values.detach().float().cpu()
+    target_rank = int(singular_values_cpu.numel())
     spectral_norm = (
         float(singular_values_cpu[0].item()) if target_rank > 0 else 0.0
     )
@@ -147,7 +187,7 @@ def truncated_svd(
         if spectral_norm > 0.0
         else 0.0
     )
-    result = {
+    return {
         "shape": list(original_shape),
         "num_singular_values": target_rank,
         "singular_values": singular_values_cpu.tolist(),
@@ -157,14 +197,74 @@ def truncated_svd(
         "stable_rank": stable_rank,
         "topk_energy_ratio": topk_energy_ratio,
     }
-    del (
-        left,
-        right,
-        matrix_fp32,
-        frobenius_norm_tensor,
-        singular_values,
-        singular_values_cpu,
+
+
+def truncated_svd_with_subspace(
+    matrix: torch.Tensor,
+    reference_u: torch.Tensor,
+    reference_v: torch.Tensor,
+    svd_rank: int,
+    oversample: int = 8,
+    niter: int = 2,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Compute update SVD and the normalized U/V overlap with a fixed basis."""
+    left, singular_values, right, frobenius_norm = truncated_svd_factors(
+        matrix,
+        svd_rank=svd_rank,
+        oversample=oversample,
+        niter=niter,
+        seed=seed,
     )
+    if reference_u.ndim != 2 or reference_v.ndim != 2:
+        raise ValueError("Reference U and V must both be matrices")
+    if reference_u.shape[0] != left.shape[0] or reference_v.shape[0] != right.shape[0]:
+        raise ValueError(
+            "Reference/update SVD shapes differ: "
+            f"U {tuple(reference_u.shape)} vs {tuple(left.shape)}, "
+            f"V {tuple(reference_v.shape)} vs {tuple(right.shape)}"
+        )
+    rank = min(
+        int(left.shape[1]),
+        int(right.shape[1]),
+        int(reference_u.shape[1]),
+        int(reference_v.shape[1]),
+    )
+    if rank <= 0:
+        raise ValueError("Subspace rank must be positive")
+    result = summarize_svd(
+        matrix.shape,
+        singular_values,
+        frobenius_norm=frobenius_norm,
+    )
+    if frobenius_norm == 0.0:
+        phi_u = 0.0
+        phi_v = 0.0
+    else:
+        update_u = left[:, :rank]
+        update_v = right[:, :rank]
+        base_u = reference_u[:, :rank].to(
+            device=update_u.device, dtype=update_u.dtype
+        )
+        base_v = reference_v[:, :rank].to(
+            device=update_v.device, dtype=update_v.dtype
+        )
+        phi_u = float(
+            (update_u.transpose(0, 1) @ base_u).square().sum().div(rank).item()
+        )
+        phi_v = float(
+            (update_v.transpose(0, 1) @ base_v).square().sum().div(rank).item()
+        )
+        phi_u = min(1.0, max(0.0, phi_u))
+        phi_v = min(1.0, max(0.0, phi_v))
+    result.update(
+        {
+            "subspace_rank": rank,
+            "subspace_phi_u": phi_u,
+            "subspace_phi_v": phi_v,
+        }
+    )
+    del left, singular_values, right
     return result
 
 
@@ -348,3 +448,115 @@ def aggregate_effective_rank(
         svd_rank,
         score_scope=score_scope,
     )
+
+
+def aggregate_subspace_similarity(
+    matrix_results: Dict[str, Dict[str, Any]],
+    svd_rank: int,
+    score_scope: str,
+    score_side: str = "u",
+) -> Dict[str, Any]:
+    """Average per-matrix backbone/update subspace overlap for selection."""
+    if score_scope not in SCORE_SCOPES:
+        raise ValueError(f"Unsupported subspace score scope: {score_scope}")
+    if score_side not in {"u", "v", "mean"}:
+        raise ValueError(f"Unsupported subspace score side: {score_side}")
+
+    per_family: Dict[str, Dict[int, Dict[str, float]]] = {
+        label: {} for label in TRANSFORMER_MATRIX_LABELS
+    }
+    for parameter_name, matrix_result in matrix_results.items():
+        metadata = transformer_parameter_metadata(parameter_name)
+        if metadata is None:
+            raise RuntimeError(
+                f"Unexpected matrix in transformer_2d scope: {parameter_name}"
+            )
+        layer_index, family_label = metadata
+        if layer_index in per_family[family_label]:
+            raise RuntimeError(
+                f"Duplicate {family_label} update for layer {layer_index}"
+            )
+        phi_u = float(matrix_result["subspace_phi_u"])
+        phi_v = float(matrix_result["subspace_phi_v"])
+        if not 0.0 <= phi_u <= 1.0 or not 0.0 <= phi_v <= 1.0:
+            raise ValueError(
+                f"Subspace scores must lie in [0, 1], got {(phi_u, phi_v)}"
+            )
+        per_family[family_label][layer_index] = {"u": phi_u, "v": phi_v}
+
+    layer_sets = {
+        label: set(layer_values) for label, layer_values in per_family.items()
+    }
+    missing = [label for label, layers in layer_sets.items() if not layers]
+    if missing:
+        raise RuntimeError(
+            "Cannot compute subspace score: no matrices found for "
+            + ", ".join(missing)
+        )
+    reference_layers = layer_sets[TRANSFORMER_MATRIX_LABELS[0]]
+    inconsistent = {
+        label: sorted(layers)
+        for label, layers in layer_sets.items()
+        if layers != reference_layers
+    }
+    if inconsistent:
+        raise RuntimeError(
+            f"Transformer matrix families do not cover identical layers: {inconsistent}"
+        )
+
+    family_means = {
+        label: {
+            side: math.fsum(values[side] for values in per_family[label].values())
+            / len(per_family[label])
+            for side in ("u", "v")
+        }
+        for label in TRANSFORMER_MATRIX_LABELS
+    }
+    scores_by_scope: Dict[str, Dict[str, float]] = {}
+    for scope, families in SCORE_SCOPE_FAMILIES.items():
+        values_u = [
+            per_family[label][layer]["u"]
+            for label in families
+            for layer in sorted(reference_layers)
+        ]
+        values_v = [
+            per_family[label][layer]["v"]
+            for label in families
+            for layer in sorted(reference_layers)
+        ]
+        phi_u = math.fsum(values_u) / len(values_u)
+        phi_v = math.fsum(values_v) / len(values_v)
+        selected = (
+            phi_u
+            if score_side == "u"
+            else phi_v
+            if score_side == "v"
+            else (phi_u + phi_v) / 2.0
+        )
+        scores_by_scope[scope] = {
+            "phi_u": phi_u,
+            "phi_v": phi_v,
+            "score": selected,
+        }
+
+    selected_scope = scores_by_scope[score_scope]
+    return {
+        "k": svd_rank,
+        "score_scope": score_scope,
+        "score_side": score_side,
+        "aggregation": "mean_normalized_projection_overlap_across_matrices",
+        "formula_u": "||U_delta^T U_0||_F^2 / k",
+        "formula_v": "||V_delta^T V_0||_F^2 / k",
+        "recorded_parameter_scope": "transformer_2d",
+        "recorded_families": list(TRANSFORMER_MATRIX_LABELS),
+        "score_families": list(SCORE_SCOPE_FAMILIES[score_scope]),
+        "matrix_count": len(matrix_results),
+        "per_family_layer_count": {
+            label: len(per_family[label]) for label in TRANSFORMER_MATRIX_LABELS
+        },
+        "per_family_mean": family_means,
+        "scores_by_scope": scores_by_scope,
+        "phi_u": selected_scope["phi_u"],
+        "phi_v": selected_scope["phi_v"],
+        "s": selected_scope["score"],
+    }

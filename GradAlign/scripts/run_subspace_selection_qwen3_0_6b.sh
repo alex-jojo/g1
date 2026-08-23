@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3-0.6B per-prompt effective-rank SVD selection + GRPO training.
+# Qwen3-0.6B AdamW/backbone singular-subspace selection + GRPO training.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -40,10 +40,11 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-5120}"
 
 SVD_RANK="${SVD_RANK:-128}"
 SVD_SCORE_SCOPE="${SVD_SCORE_SCOPE:-${SVD_PARAMETER_SCOPE:-transformer_2d}}"
-SVD_GRADIENT_SOURCE="${SVD_GRADIENT_SOURCE:-raw}"
+SVD_GRADIENT_SOURCE="adamw"
 # full matches the exact PyTorch AdamW parameter delta, including weight decay.
 ADAMW_UPDATE_TARGET="${ADAMW_UPDATE_TARGET:-full}"
 ADAMW_GRAD_CLIP="${ADAMW_GRAD_CLIP:-1.0}"
+SUBSPACE_SCORE_SIDE="${SUBSPACE_SCORE_SIDE:-u}"
 ANALYSIS_BACKEND="${ANALYSIS_BACKEND:-independent}"
 ANALYSIS_MINIBATCH_SIZE="${ANALYSIS_MINIBATCH_SIZE:-1}"
 ANALYSIS_PREPARE_WORKERS="${ANALYSIS_PREPARE_WORKERS:-32}"
@@ -53,11 +54,7 @@ TEST_FREQ="${TEST_FREQ:--1}"
 SEED="${SEED:-1}"
 
 if [[ -z "${PREFIX}" ]]; then
-  if [[ "${SVD_GRADIENT_SOURCE}" == "adamw" ]]; then
-    PREFIX="svd_erank_qwen3_0_6b_unified_reward_v1_adamw_${ADAMW_UPDATE_TARGET}_random_warmup${STEPS_PER_SELECTION}"
-  else
-    PREFIX="svd_erank_qwen3_0_6b_unified_reward_v1"
-  fi
+  PREFIX="subspace_qwen3_0_6b_adamw_${ADAMW_UPDATE_TARGET}_phi${SUBSPACE_SCORE_SIDE}_random_warmup${STEPS_PER_SELECTION}"
 fi
 
 if ! "${PYTHON_BIN}" -c 'import datasets, torch' >/dev/null 2>&1; then
@@ -105,16 +102,16 @@ if [[ "${SVD_SCORE_SCOPE}" != "qkvo_only" && "${SVD_SCORE_SCOPE}" != "ffn_only" 
   echo "SVD_SCORE_SCOPE must be qkvo_only, ffn_only, or transformer_2d" >&2
   exit 2
 fi
-if [[ "${SVD_GRADIENT_SOURCE}" != "raw" && "${SVD_GRADIENT_SOURCE}" != "adamw" ]]; then
-  echo "SVD_GRADIENT_SOURCE must be raw or adamw" >&2
-  exit 2
-fi
 if [[ "${ADAMW_UPDATE_TARGET}" != "actual_data" && "${ADAMW_UPDATE_TARGET}" != "marginal_data" && "${ADAMW_UPDATE_TARGET}" != "full" ]]; then
   echo "ADAMW_UPDATE_TARGET must be actual_data, marginal_data, or full" >&2
   exit 2
 fi
 if [[ "${SVD_GRADIENT_SOURCE}" == "adamw" && "${ANALYSIS_BACKEND}" != "independent" ]]; then
   echo "AdamW SVD requires ANALYSIS_BACKEND=independent" >&2
+  exit 2
+fi
+if [[ "${SUBSPACE_SCORE_SIDE}" != "u" && "${SUBSPACE_SCORE_SIDE}" != "v" && "${SUBSPACE_SCORE_SIDE}" != "mean" ]]; then
+  echo "SUBSPACE_SCORE_SIDE must be u, v, or mean" >&2
   exit 2
 fi
 if [[ "${SVD_SCORE_SCOPE}" != "qkvo_only" && "${ANALYSIS_BACKEND}" != "independent" ]]; then
@@ -185,7 +182,7 @@ CMD=(
   --train_dir "${TRAIN_DIR}"
   --train_parquet "${TRAIN_PARQUET}"
   --ckpt_root "${CKPT_ROOT}"
-  --mode svd
+  --mode subspace
   --chunk_size "${CANDIDATES_PER_SELECTION}"
   --k "${SELECTION_DENOMINATOR}"
   --num_selections "${NUM_SELECTIONS}"
@@ -207,6 +204,7 @@ CMD=(
   --svd_gradient_source "${SVD_GRADIENT_SOURCE}"
   --adamw_update_target "${ADAMW_UPDATE_TARGET}"
   --adamw_grad_clip "${ADAMW_GRAD_CLIP}"
+  --subspace_score_side "${SUBSPACE_SCORE_SIDE}"
   --training_backend fsdp
   --merge_backend fsdp
   --n_gpus_per_node "${N_GPUS}"
@@ -227,7 +225,7 @@ CMD=(
   --reward_path "${REWARD_PATH}"
 )
 
-printf 'SVD selection: %d candidates -> top %d prompts every %d GRPO steps\n' \
+printf 'Subspace selection: %d candidates -> top %d prompts every %d GRPO steps\n' \
   "${CANDIDATES_PER_SELECTION}" "${SELECTED_PER_ROUND}" "${STEPS_PER_SELECTION}"
 printf 'Training: total_steps=%d, selections=%d, batch=%d, rollout_n=%d, GPUs=%d\n' \
   "${TOTAL_STEPS}" "${NUM_SELECTIONS}" "${TRAIN_BATCH_SIZE}" "${ROLLOUT_N}" "${N_GPUS}"
@@ -237,10 +235,10 @@ printf 'Inference: replicas=%d, TP=%d, PP=%d, GPUs/replica=%d\n' \
 printf 'Analysis: backend=%s, source=%s, adamw_target=%s, score_scope=%s, recorded_scope=transformer_2d, workers=%d, micro_batch=%d, prepare_workers=%d\n' \
   "${ANALYSIS_BACKEND}" "${SVD_GRADIENT_SOURCE}" "${ADAMW_UPDATE_TARGET}" "${SVD_SCORE_SCOPE}" "${N_GPUS}" \
   "${ANALYSIS_MINIBATCH_SIZE}" "${ANALYSIS_PREPARE_WORKERS}"
-if [[ "${SVD_GRADIENT_SOURCE}" == "adamw" ]]; then
-  printf 'Warm start: round 0 uses random data for %d GRPO steps; optimizer-aware selection starts at step %d.\n' \
-    "${STEPS_PER_SELECTION}" "${STEPS_PER_SELECTION}"
-fi
+printf 'Subspace score: phi_%s, descending; U0/V0 use the fixed initial backbone.\n' \
+  "${SUBSPACE_SCORE_SIDE}"
+printf 'Warm start: round 0 uses random data for %d GRPO steps; optimizer-aware selection starts at step %d.\n' \
+  "${STEPS_PER_SELECTION}" "${STEPS_PER_SELECTION}"
 printf 'Checkpoints: %s\n' "${CKPT_ROOT}"
 printf 'Reward function: %s\n' "${REWARD_PATH}"
 

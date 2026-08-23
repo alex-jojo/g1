@@ -72,6 +72,9 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
     matrices = row.get("matrices")
     if not isinstance(matrices, dict) or not matrices:
         raise ValueError(f"group_id={group_id} has no matrix results")
+    analysis_method = row.get("analysis_method", "effective_rank")
+    if analysis_method not in {"effective_rank", "subspace"}:
+        raise ValueError(f"group_id={group_id} has invalid analysis method")
     for matrix_name, matrix in matrices.items():
         for key in MATRIX_STAT_KEYS:
             try:
@@ -89,8 +92,37 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
             raise ValueError(
                 f"group_id={group_id} matrix={matrix_name} has energy ratio {ratio}"
             )
+        if analysis_method == "subspace":
+            try:
+                subspace_rank = int(matrix["subspace_rank"])
+                phi_u = float(matrix["subspace_phi_u"])
+                phi_v = float(matrix["subspace_phi_v"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"group_id={group_id} matrix={matrix_name} has invalid "
+                    "subspace results"
+                ) from error
+            if subspace_rank <= 0 or not 0.0 <= phi_u <= 1.0 or not 0.0 <= phi_v <= 1.0:
+                raise ValueError(
+                    f"group_id={group_id} matrix={matrix_name} has out-of-range "
+                    "subspace results"
+                )
     if row.get("gradient_parameter_scope") != "transformer_2d":
         raise ValueError(f"group_id={group_id} did not record QKVO and FFN")
+    gradient_source = row.get("svd_gradient_source", "raw")
+    if gradient_source not in {"raw", "adamw"}:
+        raise ValueError(f"group_id={group_id} has invalid SVD gradient source")
+    update_target = row.get("adamw_update_target")
+    if gradient_source == "adamw" and update_target not in {
+        "actual_data",
+        "marginal_data",
+        "full",
+    }:
+        raise ValueError(f"group_id={group_id} has invalid AdamW update target")
+    if gradient_source == "raw" and update_target is not None:
+        raise ValueError(f"group_id={group_id} has AdamW metadata in raw mode")
+    if analysis_method == "subspace" and gradient_source != "adamw":
+        raise ValueError(f"group_id={group_id} subspace mode is not AdamW")
     score_scope = row.get("svd_score_scope")
     if score_scope not in SCORE_SCOPES:
         raise ValueError(f"group_id={group_id} has invalid SVD score scope")
@@ -134,6 +166,12 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
         raise ValueError(f"group_id={group_id} has no group_stats")
     if stats.get("svd_score_scope") != score_scope:
         raise ValueError(f"group_id={group_id} has inconsistent group score scope")
+    if stats.get("svd_gradient_source", "raw") != gradient_source:
+        raise ValueError(f"group_id={group_id} has inconsistent gradient source")
+    if stats.get("adamw_update_target") != update_target:
+        raise ValueError(f"group_id={group_id} has inconsistent AdamW target")
+    if stats.get("analysis_method", "effective_rank") != analysis_method:
+        raise ValueError(f"group_id={group_id} has inconsistent analysis method")
     for key in GROUP_LIST_KEYS:
         if not isinstance(stats.get(key), list) or len(stats[key]) != rollout_n:
             raise ValueError(
@@ -222,6 +260,52 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
     score = float(row["effective_rank_topk"]["s"])
     if not math.isclose(float(stats.get("svd_score", math.nan)), score, rel_tol=1e-12):
         raise ValueError(f"group_id={group_id} has inconsistent SVD scores")
+    subspace = row.get("subspace_similarity")
+    if analysis_method == "subspace":
+        if not isinstance(subspace, dict):
+            raise ValueError(f"group_id={group_id} has no subspace score")
+        score_side = subspace.get("score_side")
+        if score_side not in {"u", "v", "mean"}:
+            raise ValueError(f"group_id={group_id} has invalid subspace score side")
+        phi_u = float(subspace.get("phi_u", math.nan))
+        phi_v = float(subspace.get("phi_v", math.nan))
+        subspace_score = float(subspace.get("s", math.nan))
+        expected_subspace_score = (
+            phi_u
+            if score_side == "u"
+            else phi_v
+            if score_side == "v"
+            else (phi_u + phi_v) / 2.0
+        )
+        if (
+            not 0.0 <= phi_u <= 1.0
+            or not 0.0 <= phi_v <= 1.0
+            or not math.isclose(
+                subspace_score,
+                expected_subspace_score,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(f"group_id={group_id} has inconsistent subspace score")
+        if stats.get("subspace_score_side") != score_side:
+            raise ValueError(f"group_id={group_id} has inconsistent subspace side")
+        for key, expected in (
+            ("subspace_phi_u", phi_u),
+            ("subspace_phi_v", phi_v),
+            ("subspace_score", subspace_score),
+        ):
+            if not math.isclose(
+                float(stats.get(key, math.nan)),
+                expected,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    f"group_id={group_id} has inconsistent group_stats.{key}"
+                )
+    elif subspace is not None:
+        raise ValueError(f"group_id={group_id} has subspace data in SVD mode")
 
 
 def main() -> None:

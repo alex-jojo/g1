@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, launch, and merge independent effective-rank/SVD workers."""
+"""Prepare, launch, and merge independent AdamW subspace workers."""
 
 from __future__ import annotations
 
@@ -74,10 +74,14 @@ def terminate_processes(processes: List[subprocess.Popen]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch independent single-GPU SVD")
+    parser = argparse.ArgumentParser(
+        description="Launch independent single-GPU AdamW subspace analysis"
+    )
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--responses_dir", required=True)
     parser.add_argument("--output_path", required=True)
+    parser.add_argument("--reference_model_path", required=True)
+    parser.add_argument("--reference_basis_path", required=True)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--rollout_n", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=5120)
@@ -97,12 +101,12 @@ def main() -> None:
         choices=["qkvo_only", "ffn_only", "transformer_2d"],
         default="transformer_2d",
     )
-    parser.add_argument(
-        "--svd_gradient_source",
-        choices=["raw", "adamw"],
-        default="raw",
-    )
     parser.add_argument("--optimizer_state_path", default=None)
+    parser.add_argument(
+        "--subspace_score_side",
+        choices=["u", "v", "mean"],
+        default="u",
+    )
     parser.add_argument(
         "--adamw_update_target",
         choices=["actual_data", "marginal_data", "full"],
@@ -118,15 +122,19 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.gradient_parameter_scope != "transformer_2d":
-        parser.error("Independent SVD always records QKVO and FFN matrices")
-
+        parser.error("Independent subspace always records QKVO and FFN matrices")
     if args.num_workers <= 0 or args.rollout_n <= 0:
         parser.error("num_workers and rollout_n must be positive")
-    if args.svd_gradient_source == "raw" and args.optimizer_state_path:
-        parser.error("--optimizer_state_path requires --svd_gradient_source adamw")
+
     model_path = os.path.abspath(os.path.expanduser(args.model_path))
     responses_dir = os.path.abspath(os.path.expanduser(args.responses_dir))
     output_path = os.path.abspath(os.path.expanduser(args.output_path))
+    reference_model_path = os.path.abspath(
+        os.path.expanduser(args.reference_model_path)
+    )
+    reference_basis_path = os.path.abspath(
+        os.path.expanduser(args.reference_basis_path)
+    )
     optimizer_state_path = (
         os.path.abspath(os.path.expanduser(args.optimizer_state_path))
         if args.optimizer_state_path
@@ -134,6 +142,9 @@ def main() -> None:
     )
     if optimizer_state_path and not os.path.isfile(optimizer_state_path):
         parser.error(f"Optimizer state not found: {optimizer_state_path}")
+    if not os.path.isdir(reference_model_path):
+        parser.error(f"Reference model not found: {reference_model_path}")
+
     devices = parse_visible_devices(args.num_workers)
     if args.force_prepare:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -143,6 +154,7 @@ def main() -> None:
                 stale_path = f"{worker_output}.stale_{timestamp}"
                 os.replace(worker_output, stale_path)
                 print(f"Archived stale worker output to {stale_path}", flush=True)
+
     prepare_command = [
         sys.executable,
         str(HERE / "prepare.py"),
@@ -166,6 +178,37 @@ def main() -> None:
     print("Preparing independent shards:", " ".join(prepare_command), flush=True)
     subprocess.run(prepare_command, check=True)
 
+    reference_command = [
+        sys.executable,
+        str(HERE / "prepare_reference_basis.py"),
+        "--model_path",
+        reference_model_path,
+        "--output_path",
+        reference_basis_path,
+        "--svd_rank",
+        str(args.svd_rank),
+        "--svd_oversample",
+        str(args.svd_oversample),
+        "--svd_niter",
+        str(args.svd_niter),
+        "--svd_seed",
+        str(args.svd_seed),
+        "--gradient_parameter_scope",
+        args.gradient_parameter_scope,
+    ]
+    reference_env = os.environ.copy()
+    reference_env["CUDA_VISIBLE_DEVICES"] = devices[0]
+    print(
+        "Preparing fixed initial-backbone U0/V0:",
+        " ".join(reference_command),
+        flush=True,
+    )
+    subprocess.run(reference_command, check=True, env=reference_env)
+    if not os.path.isfile(reference_basis_path):
+        raise RuntimeError(
+            f"Reference basis preparation did not create {reference_basis_path}"
+        )
+
     data_dir = os.path.join(responses_dir, "data_independent")
     manifest_path = os.path.join(data_dir, "partition_manifest.json")
     with open(manifest_path, "r", encoding="utf-8") as handle:
@@ -173,7 +216,7 @@ def main() -> None:
     analysis_config = {
         "record_schema_version": 5,
         "analysis_backend": "independent",
-        "analysis_method": "effective_rank",
+        "analysis_method": "subspace",
         "advantage_estimator": "grpo",
         "norm_adv_by_std_in_grpo": True,
         "advantage_epsilon": 1e-6,
@@ -188,12 +231,8 @@ def main() -> None:
         "rollout_n": args.rollout_n,
         "analysis_minibatch_size": 1,
         "gradient_parameter_scope": args.gradient_parameter_scope,
-        "svd_gradient_source": args.svd_gradient_source,
-        "adamw_update_target": (
-            args.adamw_update_target
-            if args.svd_gradient_source == "adamw"
-            else None
-        ),
+        "svd_gradient_source": "adamw",
+        "adamw_update_target": args.adamw_update_target,
         "optimizer_state_path": optimizer_state_path,
         "optimizer_state_size": (
             os.path.getsize(optimizer_state_path)
@@ -205,14 +244,17 @@ def main() -> None:
             if optimizer_state_path is not None
             else None
         ),
-        "adamw_cold_start": (
-            args.svd_gradient_source == "adamw" and optimizer_state_path is None
-        ),
+        "adamw_cold_start": optimizer_state_path is None,
         "adamw_lr_fallback": args.adamw_lr,
         "adamw_betas_fallback": [args.adamw_beta1, args.adamw_beta2],
         "adamw_eps_fallback": args.adamw_eps,
         "adamw_weight_decay_fallback": args.adamw_weight_decay,
         "adamw_grad_clip": args.adamw_grad_clip,
+        "reference_model_path": reference_model_path,
+        "reference_basis_path": reference_basis_path,
+        "reference_basis_size": os.path.getsize(reference_basis_path),
+        "reference_basis_mtime_ns": os.stat(reference_basis_path).st_mtime_ns,
+        "subspace_score_side": args.subspace_score_side,
         "svd_score_scope": args.svd_score_scope,
         "matrix_statistics": [
             "frobenius_norm",
@@ -238,7 +280,7 @@ def main() -> None:
     manifest["gradient_parameter_scope"] = args.gradient_parameter_scope
     manifest["svd_score_scope"] = args.svd_score_scope
     atomic_write_json(manifest_path, manifest)
-    print(f"Independent analysis signature: {signature}", flush=True)
+    print(f"Independent subspace signature: {signature}", flush=True)
 
     stale_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     for rank in range(args.num_workers):
@@ -254,6 +296,7 @@ def main() -> None:
                 f"Archived incompatible worker output to {stale_path}",
                 flush=True,
             )
+
     processes: List[subprocess.Popen] = []
     for rank, device in enumerate(devices):
         worker_output = os.path.join(responses_dir, f"svd_rank_{rank}.jsonl")
@@ -275,7 +318,7 @@ def main() -> None:
             "--analysis_signature",
             signature,
             "--analysis_method",
-            "effective_rank",
+            "subspace",
             "--rollout_n",
             str(args.rollout_n),
             "--svd_rank",
@@ -291,7 +334,7 @@ def main() -> None:
             "--svd_score_scope",
             args.svd_score_scope,
             "--svd_gradient_source",
-            args.svd_gradient_source,
+            "adamw",
             "--adamw_update_target",
             args.adamw_update_target,
             "--adamw_lr",
@@ -306,6 +349,10 @@ def main() -> None:
             str(args.adamw_weight_decay),
             "--adamw_grad_clip",
             str(args.adamw_grad_clip),
+            "--reference_basis_path",
+            reference_basis_path,
+            "--subspace_score_side",
+            args.subspace_score_side,
         ]
         if optimizer_state_path is not None:
             worker_command.extend(
@@ -326,7 +373,7 @@ def main() -> None:
         ):
             worker_env.pop(variable, None)
         print(
-            f"Launching worker {rank} on CUDA_VISIBLE_DEVICES={device}: "
+            f"Launching subspace worker {rank} on CUDA_VISIBLE_DEVICES={device}: "
             + " ".join(worker_command),
             flush=True,
         )
@@ -340,7 +387,7 @@ def main() -> None:
                 return_codes = [process.poll() for process in processes]
                 raise subprocess.CalledProcessError(
                     next(code for code in return_codes if code not in (None, 0)),
-                    "independent SVD workers",
+                    "independent subspace workers",
                 )
             if all(process.poll() == 0 for process in processes):
                 break
@@ -363,7 +410,7 @@ def main() -> None:
         "--analysis_signature",
         signature,
     ]
-    print("Merging independent SVD results:", " ".join(merge_command), flush=True)
+    print("Merging independent subspace results:", " ".join(merge_command), flush=True)
     subprocess.run(merge_command, check=True)
 
 

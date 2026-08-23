@@ -41,6 +41,51 @@ def write_jsonl(records: List[dict], out_path: str) -> None:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def prepare_random_warmup_dataset(
+    train_dir: str,
+    train_parquet: str,
+    output_dir: str,
+    sample_count: int,
+    seed: int,
+) -> None:
+    """Create the deterministic random data used only for AdamW warm start."""
+
+    dataset = _load_train_dataset(train_dir, train_parquet)
+    if len(dataset) < sample_count:
+        raise SystemExit(
+            "AdamW warmup needs exactly "
+            f"{sample_count} prompts, but the full training set has {len(dataset)}"
+        )
+    selected = dataset.shuffle(seed=seed).select(range(sample_count))
+    os.makedirs(output_dir, exist_ok=True)
+    jsonl_path = os.path.join(output_dir, "train.jsonl")
+    parquet_path = os.path.join(output_dir, "train.parquet")
+    write_jsonl(selected.to_list(), jsonl_path)
+    selected.to_parquet(parquet_path)
+    manifest = {
+        "selection_schema_version": 1,
+        "selection_method": "adamw_random_warmup",
+        "seed": seed,
+        "candidate_count": len(dataset),
+        "selected_count": len(selected),
+        "source_train_dir": os.path.abspath(train_dir),
+        "source_train_parquet": train_parquet,
+        "selected_jsonl": os.path.abspath(jsonl_path),
+        "selected_parquet": os.path.abspath(parquet_path),
+    }
+    with open(
+        os.path.join(output_dir, "selection_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    print(
+        f"Prepared AdamW random warmup data: {len(selected)}/{len(dataset)} "
+        f"prompts with seed {seed} -> {output_dir}"
+    )
+
+
 def chunk_dataset(train_dir: str, exp_root: str, train_parquet: str, chunk_size: int, seed: int) -> Tuple[int, List[str]]:
     ds = _load_train_dataset(train_dir, train_parquet)
     total = len(ds)
@@ -194,6 +239,19 @@ def _independent_analysis_is_compatible(
     rollout_n: int,
     svd_rank: int,
     svd_score_scope: str,
+    analysis_method: str,
+    svd_gradient_source: str,
+    adamw_update_target: str,
+    optimizer_state_path: str | None,
+    adamw_lr: float,
+    adamw_beta1: float,
+    adamw_beta2: float,
+    adamw_eps: float,
+    adamw_weight_decay: float,
+    adamw_grad_clip: float,
+    reference_model_path: str | None,
+    reference_basis_path: str | None,
+    subspace_score_side: str,
     max_length: int,
     expected_groups: int,
 ) -> bool:
@@ -205,9 +263,25 @@ def _independent_analysis_is_compatible(
     signature = manifest.get("analysis_signature")
     if not isinstance(analysis, dict) or not isinstance(signature, str):
         return False
+    normalized_optimizer_path = (
+        os.path.abspath(os.path.expanduser(optimizer_state_path))
+        if optimizer_state_path
+        else None
+    )
+    normalized_reference_model = (
+        os.path.abspath(os.path.expanduser(reference_model_path))
+        if reference_model_path
+        else None
+    )
+    normalized_reference_basis = (
+        os.path.abspath(os.path.expanduser(reference_basis_path))
+        if reference_basis_path
+        else None
+    )
     expected = {
         "record_schema_version": 5,
         "analysis_backend": "independent",
+        "analysis_method": analysis_method,
         "advantage_estimator": "grpo",
         "norm_adv_by_std_in_grpo": True,
         "advantage_epsilon": 1e-6,
@@ -217,6 +291,52 @@ def _independent_analysis_is_compatible(
         "rollout_n": rollout_n,
         "analysis_minibatch_size": 1,
         "gradient_parameter_scope": "transformer_2d",
+        "svd_gradient_source": svd_gradient_source,
+        "adamw_update_target": (
+            adamw_update_target if svd_gradient_source == "adamw" else None
+        ),
+        "optimizer_state_path": normalized_optimizer_path,
+        "optimizer_state_size": (
+            os.path.getsize(normalized_optimizer_path)
+            if normalized_optimizer_path is not None
+            else None
+        ),
+        "optimizer_state_mtime_ns": (
+            os.stat(normalized_optimizer_path).st_mtime_ns
+            if normalized_optimizer_path is not None
+            else None
+        ),
+        "adamw_cold_start": (
+            svd_gradient_source == "adamw" and normalized_optimizer_path is None
+        ),
+        "adamw_lr_fallback": adamw_lr,
+        "adamw_betas_fallback": [adamw_beta1, adamw_beta2],
+        "adamw_eps_fallback": adamw_eps,
+        "adamw_weight_decay_fallback": adamw_weight_decay,
+        "adamw_grad_clip": adamw_grad_clip,
+        "reference_model_path": (
+            normalized_reference_model if analysis_method == "subspace" else None
+        ),
+        "reference_basis_path": (
+            normalized_reference_basis if analysis_method == "subspace" else None
+        ),
+        "reference_basis_size": (
+            os.path.getsize(normalized_reference_basis)
+            if analysis_method == "subspace"
+            and normalized_reference_basis is not None
+            and os.path.isfile(normalized_reference_basis)
+            else None
+        ),
+        "reference_basis_mtime_ns": (
+            os.stat(normalized_reference_basis).st_mtime_ns
+            if analysis_method == "subspace"
+            and normalized_reference_basis is not None
+            and os.path.isfile(normalized_reference_basis)
+            else None
+        ),
+        "subspace_score_side": (
+            subspace_score_side if analysis_method == "subspace" else None
+        ),
         "svd_score_scope": svd_score_scope,
         "svd_rank": svd_rank,
         "svd_q": svd_rank + 8,
@@ -241,7 +361,11 @@ def _independent_analysis_is_compatible(
         first_row.get("analysis_backend") == "independent"
         and first_row.get("analysis_signature") == signature
         and first_row.get("record_schema_version") == 5
+        and first_row.get("analysis_method", "effective_rank") == analysis_method
         and first_row.get("gradient_parameter_scope") == "transformer_2d"
+        and first_row.get("svd_gradient_source") == svd_gradient_source
+        and first_row.get("adamw_update_target")
+        == (adamw_update_target if svd_gradient_source == "adamw" else None)
         and first_row.get("svd_score_scope") == svd_score_scope
         and group_stats_rows == expected_groups
         and first_group_stats.get("analysis_signature") == signature
@@ -297,7 +421,7 @@ def main():
     parser.add_argument("--seed", default=42, type=int)
 
     # Selection controls
-    parser.add_argument("--mode", choices=["sim", "svd", "simacc", "acc", "rand", "accgreedy", 'align', 'negsim', 'norm', 'dot'], required=True)
+    parser.add_argument("--mode", choices=["sim", "svd", "subspace", "simacc", "acc", "rand", "accgreedy", 'align', 'negsim', 'norm', 'dot'], required=True)
     parser.add_argument("--acc_low", type=float, default=0.2)
     parser.add_argument("--acc_high", type=float, default=0.8)
     parser.add_argument("--epochs_per_select", type=int, default=1,
@@ -366,6 +490,33 @@ def main():
     parser.add_argument("--svd_rank", type=int, default=128,
                         help="Number of leading singular values used by SVD scoring")
     parser.add_argument(
+        "--svd_gradient_source",
+        choices=["raw", "adamw"],
+        default="raw",
+        help="Analyze raw GRPO gradients or AdamW counterfactual deltas",
+    )
+    parser.add_argument(
+        "--adamw_update_target",
+        choices=["actual_data", "marginal_data", "full"],
+        default="full",
+        help=(
+            "AdamW tensor analyzed by SVD: full is the exact parameter delta; "
+            "actual_data excludes decoupled weight decay; marginal_data also "
+            "removes the zero-gradient momentum baseline"
+        ),
+    )
+    parser.add_argument("--adamw_beta1", type=float, default=0.9)
+    parser.add_argument("--adamw_beta2", type=float, default=0.999)
+    parser.add_argument("--adamw_eps", type=float, default=1e-8)
+    parser.add_argument("--adamw_weight_decay", type=float, default=0.01)
+    parser.add_argument("--adamw_grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--subspace_score_side",
+        choices=["u", "v", "mean"],
+        default="u",
+        help="Use left, right, or their mean backbone/update subspace overlap",
+    )
+    parser.add_argument(
         "--svd_score_scope",
         "--svd_parameter_scope",
         dest="svd_score_scope",
@@ -412,10 +563,35 @@ def main():
         parser.error("--n_gpus_per_node must be > 0")
     if args.analysis_num_gpus <= 0 or args.analysis_prepare_workers <= 0:
         parser.error("--analysis_num_gpus and --analysis_prepare_workers must be > 0")
-    if args.analysis_backend == "independent" and args.mode != "svd":
-        parser.error("--analysis_backend independent is only supported with --mode svd")
+    spectral_modes = {"svd", "subspace"}
+    if args.analysis_backend == "independent" and args.mode not in spectral_modes:
+        parser.error(
+            "--analysis_backend independent is only supported with "
+            "--mode svd/subspace"
+        )
     if args.analysis_backend == "independent" and args.minibatch_size != 1:
         parser.error("Independent SVD requires --minibatch_size 1")
+    if args.svd_gradient_source == "adamw" and (
+        args.mode not in spectral_modes
+        or args.analysis_backend != "independent"
+        or args.training_backend != "fsdp"
+        or args.merge_backend != "fsdp"
+    ):
+        parser.error(
+            "AdamW spectral analysis requires mode=svd/subspace, independent "
+            "analysis, and FSDP "
+            "training/merge backends"
+        )
+    if args.mode == "subspace" and args.svd_gradient_source != "adamw":
+        parser.error("--mode subspace requires --svd_gradient_source adamw")
+    if args.mode == "subspace" and not args.model_path:
+        parser.error(
+            "--mode subspace requires --model_path as the fixed initial backbone"
+        )
+    if args.svd_gradient_source == "adamw" and args.use_optimizer:
+        parser.error(
+            "Do not combine legacy --use_optimizer with --svd_gradient_source adamw"
+        )
     if args.svd_score_scope is None:
         args.svd_score_scope = (
             "transformer_2d"
@@ -489,6 +665,12 @@ def main():
         f"({100.0 / args.k:.1f}%), then train {args.iters_per_select} global steps "
         f"({train_epochs} epoch(s) at batch size {args.train_batch_size})."
     )
+    if args.svd_gradient_source == "adamw":
+        print(
+            "AdamW warm start: round 0 skips rollout/spectral selection, samples "
+            f"{select_n} random prompts from the full training set, and trains "
+            f"{args.iters_per_select} steps before optimizer-aware selection starts."
+        )
 
     # Resolve dataset dirs when not explicitly provided
     train_dir = args.train_dir or get_dataset_dir(args.train_dataset, args.model)
@@ -503,6 +685,15 @@ def main():
     # ckpt_root/{exp_name}/chunks/chunk_{i}
     exp_ckpt_root = os.path.join(args.ckpt_root, exp_name)
     os.makedirs(exp_ckpt_root, exist_ok=True)
+    reference_basis_path = (
+        os.path.join(
+            exp_ckpt_root,
+            "reference_svd",
+            f"initial_backbone_top{args.svd_rank}_seed0.pt",
+        )
+        if args.mode == "subspace"
+        else None
+    )
     _configure_wandb(exp_ckpt_root, args.project_name, args.trainer_logger)
     chunks_root = os.path.join(exp_ckpt_root, "chunks")
     os.makedirs(chunks_root, exist_ok=True)
@@ -557,12 +748,17 @@ def main():
         print(f"Auto-resume: resuming from iteration {i_start}")
 
     for i in range(i_start, args.num_selections):
-        chunk_idx = i % num_chunks
+        is_adamw_warmup = args.svd_gradient_source == "adamw" and i == 0
+        scored_round_index = (
+            i - 1 if args.svd_gradient_source == "adamw" else i
+        )
+        chunk_idx = max(0, scored_round_index) % num_chunks
         chunk_dir = os.path.join(chunks_root, f"chunk_{chunk_idx}")
         prompts_file = os.path.join(chunk_dir, "train.jsonl")
         # Fixed global step directory naming to align with VERL
         gstep = i * args.iters_per_select
         step_root = os.path.join(exp_ckpt_root, f"global_step_{gstep}")
+        adamw_optimizer_state_path = None
         train_parts_root = os.path.join(step_root, "train_split")
         val_dir_override = os.path.join(step_root, "val_responses") if requires_validation_gradient else None
         train_resp_dir = os.path.join(train_parts_root, "part_0")
@@ -612,6 +808,18 @@ def main():
                 _run_stage(convert_cmd)
                 if not os.path.isfile(optimizer_state_path):
                     raise SystemExit(f"Optimizer state not found: {optimizer_state_path}")
+            if args.svd_gradient_source == "adamw":
+                adamw_optimizer_state_path = os.path.join(
+                    step_root,
+                    "actor",
+                    "optimizer_for_analysis.pt",
+                )
+                if not os.path.isfile(adamw_optimizer_state_path):
+                    raise SystemExit(
+                        "AdamW analysis state not found: "
+                        f"{adamw_optimizer_state_path}. The previous FSDP training "
+                        "segment must enable optimizer_for_analysis export."
+                    )
 
         current_model_path = merged_model_path or args.model_path
 
@@ -653,7 +861,12 @@ def main():
             actual_train, train_tokens_available = _response_cache_status(resp_json)
         elif os.path.isfile(resp_sorted):
             actual_train, train_tokens_available = _response_cache_status(resp_sorted)
-        if args.mode == "rand":
+        if is_adamw_warmup:
+            print(
+                f"Skip train inference for round {i}: AdamW random warmup "
+                "does not score candidate prompts"
+            )
+        elif args.mode == "rand":
             print(
                 f"Skip train inference for step {i}: "
                 "rand selection does not use rollout responses"
@@ -677,7 +890,11 @@ def main():
         # Use the same custom reward function as VERL training. Keeping this as
         # a separate stage lets a complete rollout cache be rescored without
         # running vLLM again.
-        if args.inference_reward_path and args.mode != "rand":
+        if (
+            not is_adamw_warmup
+            and args.inference_reward_path
+            and args.mode != "rand"
+        ):
             scoring_input = resp_json if os.path.isfile(resp_json) else resp_sorted
             score_cmd = [
                 sys.executable,
@@ -728,7 +945,7 @@ def main():
                 shutil.rmtree(prepared_data_dir)
 
         # 3b) Local validation inference → responses.json in step-root val_responses (flat)
-        if args.mode in ['sim', 'simacc', 'negsim', 'dot']:
+        if not is_adamw_warmup and args.mode in ['sim', 'simacc', 'negsim', 'dot']:
             val_prompts_file = os.path.join(val_dir, "train.jsonl")
             if not os.path.isfile(val_prompts_file):
                 raise SystemExit(f"Validation prompts not found: {val_prompts_file}")
@@ -814,7 +1031,7 @@ def main():
                     _run_stage(val_sort_cmd)
 
         # 3) Gradient analysis (GradAlign modes or per-prompt SVD score)
-        if args.mode in {"sim", "svd", "simacc", "align", "negsim", 'norm', 'dot'}:
+        if not is_adamw_warmup and args.mode in {"sim", "svd", "subspace", "simacc", "align", "negsim", 'norm', 'dot'}:
             if args.mode == 'align' or args.mode == 'norm':
                 args.val_dataset = args.train_dataset
                 val_dir_override = train_resp_dir
@@ -837,21 +1054,45 @@ def main():
                 "--mixed_precision", "bf16",
                 "--max_length", str(args.max_model_len),
             ]
-            if args.mode != 'svd':
+            if args.mode not in spectral_modes:
                 ana_cmd.extend([
                     "--val_dataset", args.val_dataset,
                     "--val_responses_dir", val_dir_override,
                 ])
             if current_model_path:
                 ana_cmd.extend(["--model_path", current_model_path])
-            if args.mode in {'svd', 'norm', 'dot'}:
+            if args.mode in {'svd', 'subspace', 'norm', 'dot'}:
                 ana_cmd.extend(["--mode", args.mode])
-            if args.mode == 'svd':
+            if args.mode in spectral_modes:
                 ana_cmd.extend([
                     "--svd_rank", str(args.svd_rank),
                     "--svd_score_scope", args.svd_score_scope,
+                    "--svd_gradient_source", args.svd_gradient_source,
+                    "--adamw_update_target", args.adamw_update_target,
+                    "--adamw_lr", str(args.lr),
+                    "--adamw_beta1", str(args.adamw_beta1),
+                    "--adamw_beta2", str(args.adamw_beta2),
+                    "--adamw_eps", str(args.adamw_eps),
+                    "--adamw_weight_decay", str(args.adamw_weight_decay),
+                    "--adamw_grad_clip", str(args.adamw_grad_clip),
                 ])
-                analysis_path = os.path.join(train_part_dir, f"svd_results_top{args.svd_rank}.jsonl")
+                if args.mode == "subspace":
+                    ana_cmd.extend([
+                        "--reference_model_path", args.model_path,
+                        "--reference_basis_path", reference_basis_path,
+                        "--subspace_score_side", args.subspace_score_side,
+                    ])
+                if adamw_optimizer_state_path is not None:
+                    ana_cmd.extend([
+                        "--optimizer_state_path",
+                        adamw_optimizer_state_path,
+                    ])
+                analysis_filename = (
+                    f"subspace_results_top{args.svd_rank}.jsonl"
+                    if args.mode == "subspace"
+                    else f"svd_results_top{args.svd_rank}.jsonl"
+                )
+                analysis_path = os.path.join(train_part_dir, analysis_filename)
             else:
                 analysis_path = os.path.join(train_part_dir, "similarity_results_cosine_real.jsonl")
 
@@ -890,6 +1131,23 @@ def main():
                     rollout_n=args.n_samples_train,
                     svd_rank=args.svd_rank,
                     svd_score_scope=args.svd_score_scope,
+                    analysis_method=(
+                        "subspace" if args.mode == "subspace" else "effective_rank"
+                    ),
+                    svd_gradient_source=args.svd_gradient_source,
+                    adamw_update_target=args.adamw_update_target,
+                    optimizer_state_path=adamw_optimizer_state_path,
+                    adamw_lr=args.lr,
+                    adamw_beta1=args.adamw_beta1,
+                    adamw_beta2=args.adamw_beta2,
+                    adamw_eps=args.adamw_eps,
+                    adamw_weight_decay=args.adamw_weight_decay,
+                    adamw_grad_clip=args.adamw_grad_clip,
+                    reference_model_path=(
+                        args.model_path if args.mode == "subspace" else None
+                    ),
+                    reference_basis_path=reference_basis_path,
+                    subspace_score_side=args.subspace_score_side,
                     max_length=args.max_model_len,
                     expected_groups=expected_analysis,
                 )
@@ -911,27 +1169,37 @@ def main():
                 _run_stage(ana_cmd)
 
         # Aggregate accuracy plus the score file used by selection.
-        if args.mode in {"sim", "svd", "simacc", "acc", "accgreedy", 'align', 'negsim', 'norm', 'dot'}:
+        if not is_adamw_warmup and args.mode in {"sim", "svd", "subspace", "simacc", "acc", "accgreedy", 'align', 'negsim', 'norm', 'dot'}:
             agg_cmd = [
                 sys.executable, os.path.join(os.path.dirname(__file__), "aggregate.py"),
                 "--model_name", args.model,
                 "--dataset", args.train_dataset,
                 "--parts_root", train_parts_root,
             ]
-            if args.mode == 'svd':
-                agg_cmd.extend(["--score_mode", "svd", "--svd_rank", str(args.svd_rank)])
+            if args.mode in spectral_modes:
+                agg_cmd.extend([
+                    "--score_mode", args.mode,
+                    "--svd_rank", str(args.svd_rank),
+                ])
             print("Executing:", " ".join(agg_cmd))
             _run_stage(agg_cmd)
 
         # 4) Select top-N according to mode
-        iter_out = os.path.join(exp_ckpt_root, "selected", f"iter_{i}_{args.mode}_{select_n}")
+        selection_label = "warmup_random" if is_adamw_warmup else args.mode
+        iter_out = os.path.join(
+            exp_ckpt_root,
+            "selected",
+            f"iter_{i}_{selection_label}_{select_n}",
+        )
         os.makedirs(iter_out, exist_ok=True)
-        select_mode = args.mode
+        select_mode = "rand" if is_adamw_warmup else args.mode
         if select_mode == 'dot' or select_mode == 'norm':
             select_mode = 'sim'
         # Preserve chunk-local candidates for scored selection modes, while the
         # random baseline samples from the complete training dataset.
-        selection_dataset_dir = train_dir if args.mode == "rand" else chunk_dir
+        selection_dataset_dir = (
+            train_dir if select_mode == "rand" else chunk_dir
+        )
         sel_cmd = [
             sys.executable, os.path.join(os.path.dirname(__file__), "select_data.py"),
             "--mode", select_mode,
@@ -944,17 +1212,28 @@ def main():
             "--iteration", str(i),
             "--global_step", str(gstep),
         ]
-        if args.mode in {"sim", "svd", "simacc", "acc", "accgreedy", "align", "negsim", 'norm', 'dot'}:
+        if not is_adamw_warmup and args.mode in {"sim", "svd", "subspace", "simacc", "acc", "accgreedy", "align", "negsim", 'norm', 'dot'}:
             sel_cmd.extend(["--parts_root", train_parts_root])
-        if args.mode == "svd":
+        if not is_adamw_warmup and args.mode in spectral_modes:
             sel_cmd.extend(["--svd_rank", str(args.svd_rank)])
-        if args.mode == "acc":
+        if not is_adamw_warmup and args.mode == "acc":
             sel_cmd.extend(["--acc_low", str(args.acc_low), "--acc_high", str(args.acc_high)])
-        print("Executing:", " ".join(sel_cmd))
-        _run_stage(sel_cmd)
+        if is_adamw_warmup:
+            prepare_random_warmup_dataset(
+                train_dir=train_dir,
+                train_parquet=args.train_parquet,
+                output_dir=iter_out,
+                sample_count=select_n,
+                seed=args.seed,
+            )
+        else:
+            print("Executing:", " ".join(sel_cmd))
+            _run_stage(sel_cmd)
 
         # 5) Launch training with selected set, fixed experiment name
-        os.system(f"rm {step_root}/data.pt")
+        cached_training_data = os.path.join(step_root, "data.pt")
+        if os.path.isfile(cached_training_data):
+            os.remove(cached_training_data)
         # print('remove data.pt')
         train_cmd = [
             sys.executable, os.path.join(os.path.dirname(__file__), "launch_verl_training.py"),
@@ -983,6 +1262,8 @@ def main():
             '--gpu_memory_utilization', str(args.gpu_memory_utilization),
             '--kl_loss_coef', str(args.kl_loss_coef),
         ]
+        if args.svd_gradient_source == "adamw":
+            train_cmd.append("--export_optimizer_state_for_analysis")
         if val_dir and args.verl_val_set:
             train_cmd.extend(["--val_dataset", args.verl_val_set, "--val_dir", val_dir])
         train_cmd.append("--use-kl-loss" if args.use_kl_loss else "--no-use-kl-loss")
@@ -1002,6 +1283,19 @@ def main():
             
         print("Executing:", " ".join(train_cmd))
         _run_stage(train_cmd)
+        if args.svd_gradient_source == "adamw":
+            next_optimizer_state = os.path.join(
+                exp_ckpt_root,
+                f"global_step_{(i + 1) * args.iters_per_select}",
+                "actor",
+                "optimizer_for_analysis.pt",
+            )
+            if not os.path.isfile(next_optimizer_state):
+                raise SystemExit(
+                    "Training completed without the AdamW analysis snapshot: "
+                    f"{next_optimizer_state}"
+                )
+            print(f"Verified AdamW state for next round: {next_optimizer_state}")
 
 
 if __name__ == "__main__":

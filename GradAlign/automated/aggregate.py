@@ -134,7 +134,7 @@ def main():
     )
     parser.add_argument(
         "--score_mode",
-        choices=["similarity", "svd"],
+        choices=["similarity", "svd", "subspace"],
         default="similarity",
         help="Aggregate GradAlign similarity records or SVD effective-rank records",
     )
@@ -154,6 +154,12 @@ def main():
     if args.score_mode == "svd":
         per_part_filename = f"svd_results_top{args.svd_rank}.jsonl"
         sim_out = os.path.join(parts_root, f"svd_results_top{args.svd_rank}_aggregated.jsonl")
+    elif args.score_mode == "subspace":
+        per_part_filename = f"subspace_results_top{args.svd_rank}.jsonl"
+        sim_out = os.path.join(
+            parts_root,
+            f"subspace_results_top{args.svd_rank}_aggregated.jsonl",
+        )
     else:
         per_part_filename = args.similarity_filename
         sim_out = os.path.join(parts_root, "similarity_results_aggregated.jsonl")
@@ -173,4 +179,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

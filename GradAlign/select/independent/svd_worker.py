@@ -18,6 +18,15 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from adamw import (  # noqa: E402
+    NamedAdamWSnapshot,
+    UPDATE_TARGETS,
+    global_grad_norm,
+    grad_clip_coefficient,
+    simulate_adamw_delta,
+)
+from reference_basis import ReferenceBasis  # noqa: E402
+
 
 SELECT_DIR = Path(__file__).resolve().parents[1]
 if str(SELECT_DIR) not in sys.path:
@@ -29,6 +38,8 @@ from svd_utils import (  # noqa: E402
     aggregate_effective_rank,
     is_matrix_parameter,
     truncated_svd,
+    truncated_svd_with_subspace,
+    aggregate_subspace_similarity,
     zero_svd_result,
 )
 
@@ -170,13 +181,17 @@ def matrix_parameter_specs(
 
 
 def configure_matrix_gradients(
-    model: torch.nn.Module, parameter_scope: str
+    model: torch.nn.Module, parameter_scope: str, *, require_all_gradients: bool
 ) -> List[tuple]:
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
     specs = matrix_parameter_specs(model, parameter_scope)
-    for _, parameter in specs:
-        parameter.requires_grad_(True)
+    if require_all_gradients:
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    else:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for _, parameter in specs:
+            parameter.requires_grad_(True)
     return specs
 
 
@@ -300,6 +315,13 @@ def compute_group_gradients(
 def compute_group_svd(
     parameter_specs: List[tuple],
     zero_advantage: bool,
+    gradient_source: str,
+    optimizer_snapshot: NamedAdamWSnapshot | None,
+    cold_start_group: Dict[str, Any],
+    adamw_update_target: str,
+    gradient_scale: float,
+    analysis_method: str,
+    reference_basis: ReferenceBasis | None,
     svd_rank: int,
     oversample: int,
     niter: int,
@@ -307,18 +329,45 @@ def compute_group_svd(
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
     for name, parameter in parameter_specs:
-        if zero_advantage:
+        if gradient_source == "raw" and zero_advantage:
             result = zero_svd_result(parameter.shape, svd_rank)
         else:
-            if parameter.grad is None:
+            if parameter.grad is None and not zero_advantage:
                 raise RuntimeError(f"Missing matrix gradient for {name}")
-            result = truncated_svd(
-                parameter.grad,
-                svd_rank=svd_rank,
-                oversample=oversample,
-                niter=niter,
-                seed=seed,
+            gradient = (
+                torch.zeros_like(parameter)
+                if parameter.grad is None
+                else parameter.grad.detach().mul(gradient_scale)
             )
+            analysis_tensor = gradient
+            if gradient_source == "adamw":
+                if optimizer_snapshot is None:
+                    state, group = {}, cold_start_group
+                else:
+                    state, group = optimizer_snapshot.state_and_group(name)
+                delta = simulate_adamw_delta(parameter, gradient, state, group)
+                analysis_tensor = getattr(delta, adamw_update_target)
+            if analysis_method == "subspace":
+                if reference_basis is None:
+                    raise RuntimeError("Subspace analysis requires an initial basis")
+                reference_u, reference_v = reference_basis.factors(name)
+                result = truncated_svd_with_subspace(
+                    analysis_tensor,
+                    reference_u=reference_u,
+                    reference_v=reference_v,
+                    svd_rank=svd_rank,
+                    oversample=oversample,
+                    niter=niter,
+                    seed=seed,
+                )
+            else:
+                result = truncated_svd(
+                    analysis_tensor,
+                    svd_rank=svd_rank,
+                    oversample=oversample,
+                    niter=niter,
+                    seed=seed,
+                )
         results[name] = result
     return results
 
@@ -339,6 +388,11 @@ def main() -> None:
     parser.add_argument("--manifest_path", required=True)
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--analysis_signature", required=True)
+    parser.add_argument(
+        "--analysis_method",
+        choices=["effective_rank", "subspace"],
+        default="effective_rank",
+    )
     parser.add_argument("--rollout_n", type=int, default=8)
     parser.add_argument("--svd_rank", type=int, default=128)
     parser.add_argument("--svd_oversample", type=int, default=8)
@@ -354,10 +408,67 @@ def main() -> None:
         choices=SCORE_SCOPES,
         default="transformer_2d",
     )
+    parser.add_argument(
+        "--svd_gradient_source",
+        choices=["raw", "adamw"],
+        default="raw",
+    )
+    parser.add_argument("--optimizer_state_path", default=None)
+    parser.add_argument("--reference_basis_path", default=None)
+    parser.add_argument(
+        "--subspace_score_side",
+        choices=["u", "v", "mean"],
+        default="u",
+    )
+    parser.add_argument(
+        "--adamw_update_target",
+        choices=UPDATE_TARGETS,
+        default="full",
+    )
+    parser.add_argument("--adamw_lr", type=float, default=1e-6)
+    parser.add_argument("--adamw_beta1", type=float, default=0.9)
+    parser.add_argument("--adamw_beta2", type=float, default=0.999)
+    parser.add_argument("--adamw_eps", type=float, default=1e-8)
+    parser.add_argument("--adamw_weight_decay", type=float, default=0.01)
+    parser.add_argument("--adamw_grad_clip", type=float, default=1.0)
     args = parser.parse_args()
 
     if args.gradient_parameter_scope != "transformer_2d":
         parser.error("Independent SVD must record QKVO and FFN matrices")
+    if args.svd_gradient_source == "raw" and args.optimizer_state_path:
+        parser.error("--optimizer_state_path requires --svd_gradient_source adamw")
+    if args.optimizer_state_path and not os.path.isfile(args.optimizer_state_path):
+        parser.error(f"Optimizer state not found: {args.optimizer_state_path}")
+    if args.analysis_method == "subspace" and args.svd_gradient_source != "adamw":
+        parser.error("Subspace analysis requires --svd_gradient_source adamw")
+    if args.analysis_method == "subspace" and not args.reference_basis_path:
+        parser.error("Subspace analysis requires --reference_basis_path")
+    if args.reference_basis_path and not os.path.isfile(args.reference_basis_path):
+        parser.error(f"Reference basis not found: {args.reference_basis_path}")
+
+    optimizer_snapshot = (
+        NamedAdamWSnapshot.load(args.optimizer_state_path)
+        if args.optimizer_state_path
+        else None
+    )
+    reference_basis = (
+        ReferenceBasis.load(args.reference_basis_path)
+        if args.reference_basis_path
+        else None
+    )
+    if reference_basis is not None and reference_basis.rank < args.svd_rank:
+        parser.error(
+            f"Reference basis rank {reference_basis.rank} is below requested "
+            f"rank {args.svd_rank}"
+        )
+    cold_start_group = {
+        "lr": args.adamw_lr,
+        "betas": (args.adamw_beta1, args.adamw_beta2),
+        "eps": args.adamw_eps,
+        "weight_decay": args.adamw_weight_decay,
+        "amsgrad": False,
+        "maximize": False,
+    }
 
     if torch.cuda.device_count() != 1:
         raise RuntimeError(
@@ -401,13 +512,17 @@ def main() -> None:
     )
     model.config.use_cache = False
     parameter_specs = configure_matrix_gradients(
-        model, args.gradient_parameter_scope
+        model,
+        args.gradient_parameter_scope,
+        require_all_gradients=args.svd_gradient_source == "adamw",
     )
     model.to(device)
     model.train()
     print(
         f"[worker {args.rank}] loaded model; scope={args.gradient_parameter_scope} "
-        f"score_scope={args.svd_score_scope} matrices={len(parameter_specs)}",
+        f"method={args.analysis_method} score_scope={args.svd_score_scope} "
+        f"source={args.svd_gradient_source} "
+        f"adamw_target={args.adamw_update_target} matrices={len(parameter_specs)}",
         flush=True,
     )
 
@@ -416,18 +531,50 @@ def main() -> None:
         group_loss, zero_advantage, group_stats = compute_group_gradients(
             model, grouped_entries[group_id], device
         )
+        gradient_norm = (
+            global_grad_norm(model.parameters())
+            if args.svd_gradient_source == "adamw"
+            else None
+        )
+        gradient_scale = (
+            grad_clip_coefficient(gradient_norm, args.adamw_grad_clip)
+            if gradient_norm is not None
+            else 1.0
+        )
         matrix_results = compute_group_svd(
             parameter_specs,
             zero_advantage=zero_advantage,
+            gradient_source=args.svd_gradient_source,
+            optimizer_snapshot=optimizer_snapshot,
+            cold_start_group=cold_start_group,
+            adamw_update_target=args.adamw_update_target,
+            gradient_scale=gradient_scale,
+            analysis_method=args.analysis_method,
+            reference_basis=reference_basis,
             svd_rank=args.svd_rank,
             oversample=args.svd_oversample,
             niter=args.svd_niter,
             seed=args.svd_seed,
         )
-        score = aggregate_effective_rank(
+        effective_rank_score = aggregate_effective_rank(
             matrix_results,
             args.svd_rank,
             args.svd_score_scope,
+        )
+        subspace_score = (
+            aggregate_subspace_similarity(
+                matrix_results,
+                args.svd_rank,
+                args.svd_score_scope,
+                args.subspace_score_side,
+            )
+            if args.analysis_method == "subspace"
+            else None
+        )
+        selection_score = (
+            float(subspace_score["s"])
+            if subspace_score is not None
+            else float(effective_rank_score["s"])
         )
         group_stats.update(
             {
@@ -435,8 +582,37 @@ def main() -> None:
                 "worker_rank": args.rank,
                 "loss": group_loss,
                 "zero_advantage": zero_advantage,
+                "analysis_method": args.analysis_method,
+                "svd_gradient_source": args.svd_gradient_source,
+                "adamw_update_target": (
+                    args.adamw_update_target
+                    if args.svd_gradient_source == "adamw"
+                    else None
+                ),
+                "gradient_global_norm": gradient_norm,
+                "gradient_clip_coefficient": gradient_scale,
                 "svd_score_scope": args.svd_score_scope,
-                "svd_score": float(score["s"]),
+                "svd_score": float(effective_rank_score["s"]),
+                "subspace_score_side": (
+                    args.subspace_score_side
+                    if args.analysis_method == "subspace"
+                    else None
+                ),
+                "subspace_phi_u": (
+                    float(subspace_score["phi_u"])
+                    if subspace_score is not None
+                    else None
+                ),
+                "subspace_phi_v": (
+                    float(subspace_score["phi_v"])
+                    if subspace_score is not None
+                    else None
+                ),
+                "subspace_score": (
+                    float(subspace_score["s"])
+                    if subspace_score is not None
+                    else None
+                ),
             }
         )
         row = {
@@ -447,6 +623,18 @@ def main() -> None:
             "group_id": group_id,
             "loss": group_loss,
             "zero_advantage": zero_advantage,
+            "analysis_method": args.analysis_method,
+            "svd_gradient_source": args.svd_gradient_source,
+            "adamw_update_target": (
+                args.adamw_update_target
+                if args.svd_gradient_source == "adamw"
+                else None
+            ),
+            "optimizer_state_source": (
+                optimizer_snapshot.source_path
+                if optimizer_snapshot is not None
+                else ("cold_start" if args.svd_gradient_source == "adamw" else None)
+            ),
             "gradient_parameter_scope": args.gradient_parameter_scope,
             "svd_score_scope": args.svd_score_scope,
             "svd_rank": args.svd_rank,
@@ -455,7 +643,8 @@ def main() -> None:
             "svd_niter": args.svd_niter,
             "svd_seed": args.svd_seed,
             "matrices": matrix_results,
-            "effective_rank_topk": score,
+            "effective_rank_topk": effective_rank_score,
+            "subspace_similarity": subspace_score,
             "group_stats": group_stats,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -464,7 +653,8 @@ def main() -> None:
         print(
             f"[worker {args.rank}] {completed_index}/{len(remaining_groups)} "
             f"group_id={group_id} zero={zero_advantage} "
-            f"score={score['s']:.6f} elapsed={time() - started:.1f}s",
+            f"method={args.analysis_method} score={selection_score:.6f} "
+            f"elapsed={time() - started:.1f}s",
             flush=True,
         )
 

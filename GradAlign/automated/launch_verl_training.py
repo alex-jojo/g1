@@ -78,6 +78,11 @@ def main():
     parser.add_argument("--n_gpus_per_node", type=int, default=8)
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--save_freq", type=int, default=2)
+    parser.add_argument(
+        "--export_optimizer_state_for_analysis",
+        action="store_true",
+        help="Save a full named AdamW state alongside each FSDP checkpoint",
+    )
     parser.add_argument("--test_freq", type=int, default=5)
     parser.add_argument("--total_epochs", type=int, default=1500)
     parser.add_argument("--resume_mode", type=str, default="auto")
@@ -98,6 +103,11 @@ def main():
     parser.add_argument("--reward_manager", default="naive", type=str)
 
     args = parser.parse_args()
+
+    if args.export_optimizer_state_for_analysis and args.backend != "fsdp":
+        parser.error(
+            "--export_optimizer_state_for_analysis currently requires --backend fsdp"
+        )
 
     trainer_loggers = [
         logger.strip() for logger in args.trainer_logger.split(",") if logger.strip()
@@ -240,6 +250,12 @@ def main():
             f"trainer.resume_mode={args.resume_mode}",
             f"trainer.default_local_dir={ckpts_dir}",
         ]
+
+    if args.export_optimizer_state_for_analysis:
+        cmd.append(
+            "actor_rollout_ref.actor.checkpoint.save_contents="
+            "[model,optimizer,extra,optimizer_for_analysis]"
+        )
 
     print("Executing:\n" + " \\n+    \n".join(cmd))
     subprocess.run(cmd, check=True)

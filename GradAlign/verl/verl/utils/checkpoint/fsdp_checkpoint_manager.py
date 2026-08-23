@@ -24,7 +24,15 @@ import torch.distributed
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDictConfig, StateDictType
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_optimizer_state_dict,
+)
+from torch.distributed.fsdp import (
+    ShardedOptimStateDictConfig,
+    ShardedStateDictConfig,
+    StateDictType,
+)
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
 from transformers.dynamic_module_utils import custom_object_save
 
@@ -177,6 +185,52 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
+    def _save_optimizer_for_analysis(self, local_path: str) -> None:
+        """Collect one full AdamW snapshot keyed by original parameter names."""
+
+        optimizer_state = get_optimizer_state_dict(
+            self.model,
+            self.optimizer,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+        if self.rank == 0:
+            state = optimizer_state.get("state", {})
+            if any(not isinstance(name, str) for name in state):
+                raise RuntimeError(
+                    "Full FSDP optimizer state was not keyed by parameter name"
+                )
+            if any(
+                not isinstance(name, str)
+                for group in optimizer_state.get("param_groups", [])
+                for name in group.get("params", [])
+            ):
+                raise RuntimeError(
+                    "Full FSDP optimizer groups were not keyed by parameter name"
+                )
+            output_path = os.path.join(local_path, "optimizer_for_analysis.pt")
+            temporary_path = f"{output_path}.tmp.{os.getpid()}"
+            payload = {
+                "format": "named_adamw_state_v1",
+                "optimizer_class": (
+                    f"{self.optimizer.__class__.__module__}."
+                    f"{self.optimizer.__class__.__qualname__}"
+                ),
+                "optimizer": optimizer_state,
+                "lr_scheduler": (
+                    self.lr_scheduler.state_dict()
+                    if self.lr_scheduler is not None
+                    else None
+                ),
+            }
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, output_path)
+            log_with_rank(
+                f"Saved analysis optimizer state to {os.path.abspath(output_path)}",
+                rank=self.rank,
+                logger=logger,
+            )
+        torch.distributed.barrier()
+
     def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
         """
         Save an FSDP checkpoint for this rank.
@@ -252,6 +306,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     }
                     torch.save(extra_state_dict, extra_path)
                     log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
+
+        if "optimizer_for_analysis" in self.checkpoint_save_contents:
+            if not self.should_save_optimizer:
+                raise ValueError(
+                    "optimizer_for_analysis requires optimizer in checkpoint save_contents"
+                )
+            self._save_optimizer_for_analysis(local_path)
 
         if self.rank == 0:
             # Save HF tokenizer/processor and model config on rank 0 to huggingface/ directory, no matter whether

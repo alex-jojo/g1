@@ -154,6 +154,55 @@ def _read_svd_score_map(svd_jsonl_path: str) -> Dict[int, float]:
     return _read_svd_score_data(svd_jsonl_path)[0]
 
 
+def _read_subspace_score_data(
+    score_path: str,
+) -> Tuple[Dict[int, float], Optional[str], Optional[str], Optional[str]]:
+    """Read the per-prompt normalized U/V subspace selection score."""
+    score_map: Dict[int, float] = {}
+    signatures: Set[str] = set()
+    scopes: Set[str] = set()
+    sides: Set[str] = set()
+    with open(score_path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                group_id = int(row["group_id"])
+                record = row["subspace_similarity"]
+                score = float(record["s"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                raise SystemExit(
+                    f"Invalid subspace score in {score_path}:{line_number}"
+                ) from error
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise SystemExit(
+                    f"Out-of-range subspace score for group_id={group_id}: {score}"
+                )
+            if group_id in score_map:
+                raise SystemExit(
+                    f"Duplicate group_id={group_id} in {score_path}:{line_number}"
+                )
+            score_map[group_id] = score
+            signature = row.get("analysis_signature")
+            scope = record.get("score_scope")
+            side = record.get("score_side")
+            if isinstance(signature, str) and signature:
+                signatures.add(signature)
+            if isinstance(scope, str) and scope:
+                scopes.add(scope)
+            if isinstance(side, str) and side:
+                sides.add(side)
+    if len(signatures) > 1 or len(scopes) > 1 or len(sides) > 1:
+        raise SystemExit(f"Mixed subspace configurations in {score_path}")
+    return (
+        score_map,
+        next(iter(signatures), None),
+        next(iter(scopes), None),
+        next(iter(sides), None),
+    )
+
+
 def _read_candidate_group_ids(dataset_train_path: str) -> List[int]:
     group_ids: List[int] = []
     seen: Set[int] = set()
@@ -325,6 +374,107 @@ def select_by_svd_score(
     print(f"Selection manifest written to: {manifest_path}")
 
 
+def select_by_subspace_score(
+    dataset_dir: str,
+    parts_root: str,
+    top_n: int,
+    output_dir: str,
+    svd_rank: int,
+    iteration: Optional[int] = None,
+    global_step: Optional[int] = None,
+) -> None:
+    score_path = os.path.join(
+        parts_root,
+        f"subspace_results_top{svd_rank}_aggregated.jsonl",
+    )
+    if not os.path.isfile(score_path):
+        raise SystemExit(f"Aggregated subspace score file not found: {score_path}")
+    score_map, signature, score_scope, score_side = _read_subspace_score_data(
+        score_path
+    )
+    if not score_map or top_n <= 0:
+        raise SystemExit("Subspace selection needs scores and a positive count")
+
+    dataset_train = os.path.join(dataset_dir, "train.jsonl")
+    candidate_group_ids = _read_candidate_group_ids(dataset_train)
+    candidate_set = set(candidate_group_ids)
+    scored_set = set(score_map)
+    if candidate_set != scored_set:
+        missing_scores = sorted(candidate_set.difference(scored_set))
+        unknown_scores = sorted(scored_set.difference(candidate_set))
+        raise SystemExit(
+            "Candidate/subspace group_id mismatch: "
+            f"candidates={len(candidate_set)}, scored={len(scored_set)}, "
+            f"missing_scores={len(missing_scores)} {missing_scores[:10]}, "
+            f"unknown_scores={len(unknown_scores)} {unknown_scores[:10]}"
+        )
+
+    ordered = sorted(score_map.items(), key=lambda item: (-item[1], item[0]))
+    requested_top_n = top_n
+    top_n = min(top_n, len(ordered))
+    boundary_start = max(0, top_n - 10)
+    print(
+        "Subspace scores at selection boundary:",
+        [score for _, score in ordered[boundary_start:top_n]],
+    )
+    selected_ids = {group_id for group_id, _ in ordered[:top_n]}
+    print(
+        f"Selected {len(selected_ids)} prompts by descending phi_{score_side} "
+        f"subspace score"
+    )
+    selected_jsonl, selected_parquet = _write_selected(
+        dataset_train, selected_ids, output_dir
+    )
+    selected_rows = _read_candidate_group_ids(selected_jsonl)
+    if set(selected_rows) != selected_ids or len(selected_rows) != len(selected_ids):
+        raise SystemExit("Selected dataset does not match subspace ranking")
+
+    selection_score_rows = [
+        {
+            "group_id": group_id,
+            "score": score,
+            "rank": rank,
+            "selected": rank <= top_n,
+        }
+        for rank, (group_id, score) in enumerate(ordered, 1)
+    ]
+    selection_scores_path = os.path.join(output_dir, "selection_scores.jsonl")
+    _atomic_write_jsonl(selection_scores_path, selection_score_rows)
+    manifest = {
+        "selection_schema_version": 1,
+        "selection_method": "adamw_backbone_subspace_topk_descending",
+        "iteration": iteration,
+        "global_step": global_step,
+        "candidate_count": len(candidate_group_ids),
+        "scored_candidate_count": len(score_map),
+        "requested_selected_count": requested_top_n,
+        "selected_count": len(selected_ids),
+        "score_cutoff": float(ordered[top_n - 1][1]),
+        "score_min": float(min(score_map.values())),
+        "score_max": float(max(score_map.values())),
+        "selected_group_ids": [group_id for group_id, _ in ordered[:top_n]],
+        "analysis_signature": signature,
+        "svd_rank": svd_rank,
+        "svd_score_scope": score_scope,
+        "subspace_score_side": score_side,
+        "candidate_jsonl": os.path.abspath(dataset_train),
+        "candidate_jsonl_sha256": _sha256_file(dataset_train),
+        "source_scores_jsonl": os.path.abspath(score_path),
+        "source_scores_sha256": _sha256_file(score_path),
+        "selection_scores_jsonl": os.path.abspath(selection_scores_path),
+        "selection_scores_sha256": _sha256_file(selection_scores_path),
+        "selected_jsonl": os.path.abspath(selected_jsonl),
+        "selected_jsonl_sha256": _sha256_file(selected_jsonl),
+        "selected_parquet": os.path.abspath(selected_parquet),
+        "selected_parquet_sha256": _sha256_file(selected_parquet),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest_path = os.path.join(output_dir, "selection_manifest.json")
+    _atomic_write_json(manifest_path, manifest)
+    print(f"Selection scores written to: {selection_scores_path}")
+    print(f"Selection manifest written to: {manifest_path}")
+
+
 def select_by_accuracy(dataset_dir: str, parts_root: str, n: int, acc_low: float, acc_high: float, output_dir: str, lim: int | None = None) -> None:
     acc_path = os.path.join(parts_root, "accuracy_by_problem.jsonl")
     assert os.path.isfile(acc_path), f"Accuracy file not found: {acc_path}"
@@ -404,7 +554,7 @@ def select_random(dataset_dir: str, n: int, output_dir: str, max_num: int | None
 
 def main():
     parser = argparse.ArgumentParser(description="Unified data selector by similarity/SVD/accuracy/random")
-    parser.add_argument("--mode", required=True, choices=["sim", "svd", "acc", "rand", 'simacc', 'accgreedy', 'align', 'negsim'], help="Selection mode")
+    parser.add_argument("--mode", required=True, choices=["sim", "svd", "subspace", "acc", "rand", 'simacc', 'accgreedy', 'align', 'negsim'], help="Selection mode")
     parser.add_argument("--dataset", required=True, type=str, help="Dataset key")
     parser.add_argument("--model", required=True, type=str, help="Tokenizer/model key used for dataset preparation")
     parser.add_argument(
@@ -452,6 +602,8 @@ def main():
             subdir = f"sim_{args.n}"
         elif args.mode == "svd":
             subdir = f"svd_s_top{args.svd_rank}_{args.n}"
+        elif args.mode == "subspace":
+            subdir = f"subspace_top{args.svd_rank}_{args.n}"
         elif args.mode == "align":
             subdir = f"align_{args.n}"
         elif args.mode == "negsim":
@@ -469,7 +621,7 @@ def main():
         output_dir = args.output_dir
 
     parts_root = None
-    if args.mode in {"sim", "svd", "acc", "simacc", "accgreedy", "align", "negsim"}:
+    if args.mode in {"sim", "svd", "subspace", "acc", "simacc", "accgreedy", "align", "negsim"}:
         if not args.model:
             raise SystemExit("--model is required for sim/acc modes to locate responses")
         parts_root = args.parts_root or (get_response_dir(args.dataset, args.model) + "_split")
@@ -482,6 +634,17 @@ def main():
     elif args.mode == "svd":
         assert parts_root is not None
         select_by_svd_score(
+            dataset_dir,
+            parts_root,
+            int(args.n),
+            output_dir,
+            args.svd_rank,
+            iteration=args.iteration,
+            global_step=args.global_step,
+        )
+    elif args.mode == "subspace":
+        assert parts_root is not None
+        select_by_subspace_score(
             dataset_dir,
             parts_root,
             int(args.n),
