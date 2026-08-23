@@ -215,6 +215,8 @@ def main():
             f"actor_rollout_ref.actor.clip_ratio_low={args.clip_ratio_low}",
             f"actor_rollout_ref.actor.clip_ratio_high={args.clip_ratio_high}",
             "actor_rollout_ref.model.enable_gradient_checkpointing=True",
+            "actor_rollout_ref.model.use_remove_padding=True",
+            "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
             f"actor_rollout_ref.rollout.name={args.rollout_name}",
             f"actor_rollout_ref.rollout.n={args.rollout_n}",
             f"actor_rollout_ref.rollout.val_kwargs.do_sample={str(args.rollout_val_do_sample)}",
