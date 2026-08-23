@@ -193,7 +193,7 @@ def _independent_analysis_is_compatible(
     world_size: int,
     rollout_n: int,
     svd_rank: int,
-    svd_parameter_scope: str,
+    svd_score_scope: str,
     max_length: int,
     expected_groups: int,
 ) -> bool:
@@ -206,7 +206,7 @@ def _independent_analysis_is_compatible(
     if not isinstance(analysis, dict) or not isinstance(signature, str):
         return False
     expected = {
-        "record_schema_version": 4,
+        "record_schema_version": 5,
         "analysis_backend": "independent",
         "advantage_estimator": "grpo",
         "norm_adv_by_std_in_grpo": True,
@@ -216,7 +216,8 @@ def _independent_analysis_is_compatible(
         "world_size": world_size,
         "rollout_n": rollout_n,
         "analysis_minibatch_size": 1,
-        "gradient_parameter_scope": svd_parameter_scope,
+        "gradient_parameter_scope": "transformer_2d",
+        "svd_score_scope": svd_score_scope,
         "svd_rank": svd_rank,
         "svd_q": svd_rank + 8,
         "svd_niter": 2,
@@ -239,7 +240,9 @@ def _independent_analysis_is_compatible(
     return (
         first_row.get("analysis_backend") == "independent"
         and first_row.get("analysis_signature") == signature
-        and first_row.get("record_schema_version") == 4
+        and first_row.get("record_schema_version") == 5
+        and first_row.get("gradient_parameter_scope") == "transformer_2d"
+        and first_row.get("svd_score_scope") == svd_score_scope
         and group_stats_rows == expected_groups
         and first_group_stats.get("analysis_signature") == signature
     )
@@ -363,10 +366,12 @@ def main():
     parser.add_argument("--svd_rank", type=int, default=128,
                         help="Number of leading singular values used by SVD scoring")
     parser.add_argument(
+        "--svd_score_scope",
         "--svd_parameter_scope",
-        choices=["qkvo_only", "transformer_2d"],
-        default="transformer_2d",
-        help="Matrix weights included in independent SVD scoring",
+        dest="svd_score_scope",
+        choices=["qkvo_only", "ffn_only", "transformer_2d"],
+        default=None,
+        help="Matrix families included in S; independent still records all seven",
     )
     parser.add_argument("--use_optimizer", action="store_true", default=False)
     parser.add_argument("--reward_manager", type=str, default=None)
@@ -411,6 +416,14 @@ def main():
         parser.error("--analysis_backend independent is only supported with --mode svd")
     if args.analysis_backend == "independent" and args.minibatch_size != 1:
         parser.error("Independent SVD requires --minibatch_size 1")
+    if args.svd_score_scope is None:
+        args.svd_score_scope = (
+            "transformer_2d"
+            if args.analysis_backend == "independent"
+            else "qkvo_only"
+        )
+    if args.analysis_backend != "independent" and args.svd_score_scope != "qkvo_only":
+        parser.error("Non-QKVO SVD score scopes require --analysis_backend independent")
     if args.tensor_parallel_size <= 0 or args.pipeline_parallel_size <= 0:
         parser.error("--tensor_parallel_size and --pipeline_parallel_size must be > 0")
 
@@ -836,7 +849,7 @@ def main():
             if args.mode == 'svd':
                 ana_cmd.extend([
                     "--svd_rank", str(args.svd_rank),
-                    "--svd_parameter_scope", args.svd_parameter_scope,
+                    "--svd_score_scope", args.svd_score_scope,
                 ])
                 analysis_path = os.path.join(train_part_dir, f"svd_results_top{args.svd_rank}.jsonl")
             else:
@@ -876,7 +889,7 @@ def main():
                     world_size=args.analysis_num_gpus,
                     rollout_n=args.n_samples_train,
                     svd_rank=args.svd_rank,
-                    svd_parameter_scope=args.svd_parameter_scope,
+                    svd_score_scope=args.svd_score_scope,
                     max_length=args.max_model_len,
                     expected_groups=expected_analysis,
                 )

@@ -25,6 +25,17 @@ TRANSFORMER_MATRIX_LABELS = tuple(PROJECTION_LABELS.values()) + tuple(
     MLP_PROJECTION_LABELS.values()
 )
 PARAMETER_SCOPES = ("qkvo_only", "transformer_2d")
+SCORE_SCOPES = ("qkvo_only", "ffn_only", "transformer_2d")
+SCORE_SCOPE_FAMILIES = {
+    "qkvo_only": tuple(PROJECTION_LABELS.values()),
+    "ffn_only": tuple(MLP_PROJECTION_LABELS.values()),
+    "transformer_2d": TRANSFORMER_MATRIX_LABELS,
+}
+SCORE_SCOPE_AGGREGATIONS = {
+    "qkvo_only": "sum_layers_then_equal_sum_qkvo",
+    "ffn_only": "sum_layers_then_equal_sum_gate_up_down",
+    "transformer_2d": "sum_layers_then_equal_sum_qkvo_gate_up_down",
+}
 
 _ATTENTION_WEIGHT_PATTERN = re.compile(
     r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)\."
@@ -228,8 +239,12 @@ def aggregate_qkvo_effective_rank(
 def aggregate_transformer_effective_rank(
     matrix_results: Dict[str, Dict[str, Any]],
     svd_rank: int,
+    score_scope: str = "transformer_2d",
 ) -> Dict[str, Any]:
-    """Sum effective rank over QKVO and gate/up/down in every layer."""
+    """Record all transformer matrices and select which families contribute to S."""
+    if score_scope not in SCORE_SCOPES:
+        raise ValueError(f"Unsupported SVD score scope: {score_scope}")
+
     per_family_layers: Dict[str, Dict[int, float]] = {
         label: {} for label in TRANSFORMER_MATRIX_LABELS
     }
@@ -277,6 +292,15 @@ def aggregate_transformer_effective_rank(
         label: math.fsum(per_family_layers[label].values())
         for label in TRANSFORMER_MATRIX_LABELS
     }
+    scores_by_scope = {
+        scope: math.fsum(family_sums[label] for label in families)
+        for scope, families in SCORE_SCOPE_FAMILIES.items()
+    }
+    score_families = SCORE_SCOPE_FAMILIES[score_scope]
+    score_layer_sums = {
+        str(layer): math.fsum(per_family_layers[label][layer] for label in score_families)
+        for layer in sorted(reference_layers)
+    }
     layer_counts = {
         str(layer): len(TRANSFORMER_MATRIX_LABELS)
         for layer in sorted(reference_layers)
@@ -291,24 +315,36 @@ def aggregate_transformer_effective_rank(
     return {
         "k": svd_rank,
         "zero_spectrum_effective_rank": 0.0,
-        "aggregation": "sum_layers_then_equal_sum_qkvo_gate_up_down",
+        "score_scope": score_scope,
+        "aggregation": SCORE_SCOPE_AGGREGATIONS[score_scope],
+        "recorded_parameter_scope": "transformer_2d",
+        "recorded_families": list(TRANSFORMER_MATRIX_LABELS),
+        "score_families": list(score_families),
         "matrix_count": len(matrix_results),
         "per_family_layer_count": family_counts,
         "per_family_layer_sum": family_sums,
         "per_layer_matrix_count": layer_counts,
         "per_layer_matrix_sum": layer_sums,
-        "s": math.fsum(family_sums.values()),
+        "score_per_layer_matrix_count": {
+            str(layer): len(score_families) for layer in sorted(reference_layers)
+        },
+        "score_per_layer_sum": score_layer_sums,
+        "scores_by_scope": scores_by_scope,
+        "s_qkvo": scores_by_scope["qkvo_only"],
+        "s_ffn": scores_by_scope["ffn_only"],
+        "s_transformer_2d": scores_by_scope["transformer_2d"],
+        "s": scores_by_scope[score_scope],
     }
 
 
 def aggregate_effective_rank(
     matrix_results: Dict[str, Dict[str, Any]],
     svd_rank: int,
-    parameter_scope: str,
+    score_scope: str,
 ) -> Dict[str, Any]:
-    """Aggregate per-matrix effective ranks according to the configured scope."""
-    if parameter_scope == "qkvo_only":
-        return aggregate_qkvo_effective_rank(matrix_results, svd_rank)
-    if parameter_scope == "transformer_2d":
-        return aggregate_transformer_effective_rank(matrix_results, svd_rank)
-    raise ValueError(f"Unsupported gradient parameter scope: {parameter_scope}")
+    """Compute S from one of three scopes while retaining all seven matrix families."""
+    return aggregate_transformer_effective_rank(
+        matrix_results,
+        svd_rank,
+        score_scope=score_scope,
+    )

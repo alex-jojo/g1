@@ -90,10 +90,11 @@ def _read_similarity_map(sim_jsonl_path: str) -> Dict[int, float]:
 
 def _read_svd_score_data(
     svd_jsonl_path: str,
-) -> Tuple[Dict[int, float], Optional[str]]:
+) -> Tuple[Dict[int, float], Optional[str], Optional[str]]:
     """Read the final per-prompt S from effective_rank_topk.s."""
     score_map: Dict[int, float] = {}
     analysis_signatures: Set[str] = set()
+    score_scopes: Set[str] = set()
     with open(svd_jsonl_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             s = line.strip()
@@ -129,12 +130,23 @@ def _read_svd_score_data(
             signature = obj.get("analysis_signature")
             if isinstance(signature, str) and signature:
                 analysis_signatures.add(signature)
+            score_scope = obj.get("svd_score_scope")
+            score_record = obj.get("effective_rank_topk")
+            if not score_scope and isinstance(score_record, dict):
+                score_scope = score_record.get("score_scope")
+            if not score_scope:
+                score_scope = obj.get("gradient_parameter_scope")
+            if isinstance(score_scope, str) and score_scope:
+                score_scopes.add(score_scope)
     if len(analysis_signatures) > 1:
         raise SystemExit(
             f"Mixed analysis signatures in SVD score file {svd_jsonl_path}"
         )
+    if len(score_scopes) > 1:
+        raise SystemExit(f"Mixed SVD score scopes in {svd_jsonl_path}")
     signature = next(iter(analysis_signatures), None)
-    return score_map, signature
+    score_scope = next(iter(score_scopes), None)
+    return score_map, signature, score_scope
 
 
 def _read_svd_score_map(svd_jsonl_path: str) -> Dict[int, float]:
@@ -228,7 +240,7 @@ def select_by_svd_score(
     if not os.path.isfile(score_path):
         raise SystemExit(f"Aggregated SVD score file not found: {score_path}")
 
-    score_map, analysis_signature = _read_svd_score_data(score_path)
+    score_map, analysis_signature, svd_score_scope = _read_svd_score_data(score_path)
     if not score_map:
         raise SystemExit(
             f"No effective_rank_topk.s values found in {score_path}; "
@@ -294,6 +306,7 @@ def select_by_svd_score(
         "selected_group_ids": selected_group_ids,
         "analysis_signature": analysis_signature,
         "svd_rank": svd_rank,
+        "svd_score_scope": svd_score_scope,
         "candidate_jsonl": os.path.abspath(dataset_train),
         "candidate_jsonl_sha256": _sha256_file(dataset_train),
         "source_scores_jsonl": os.path.abspath(score_path),

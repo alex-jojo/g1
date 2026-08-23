@@ -25,6 +25,7 @@ if str(SELECT_DIR) not in sys.path:
 
 from svd_utils import (  # noqa: E402
     PARAMETER_SCOPES,
+    SCORE_SCOPES,
     aggregate_effective_rank,
     is_matrix_parameter,
     truncated_svd,
@@ -348,7 +349,15 @@ def main() -> None:
         choices=PARAMETER_SCOPES,
         default="transformer_2d",
     )
+    parser.add_argument(
+        "--svd_score_scope",
+        choices=SCORE_SCOPES,
+        default="transformer_2d",
+    )
     args = parser.parse_args()
+
+    if args.gradient_parameter_scope != "transformer_2d":
+        parser.error("Independent SVD must record QKVO and FFN matrices")
 
     if torch.cuda.device_count() != 1:
         raise RuntimeError(
@@ -398,7 +407,7 @@ def main() -> None:
     model.train()
     print(
         f"[worker {args.rank}] loaded model; scope={args.gradient_parameter_scope} "
-        f"matrices={len(parameter_specs)}",
+        f"score_scope={args.svd_score_scope} matrices={len(parameter_specs)}",
         flush=True,
     )
 
@@ -418,7 +427,7 @@ def main() -> None:
         score = aggregate_effective_rank(
             matrix_results,
             args.svd_rank,
-            args.gradient_parameter_scope,
+            args.svd_score_scope,
         )
         group_stats.update(
             {
@@ -426,11 +435,12 @@ def main() -> None:
                 "worker_rank": args.rank,
                 "loss": group_loss,
                 "zero_advantage": zero_advantage,
+                "svd_score_scope": args.svd_score_scope,
                 "svd_score": float(score["s"]),
             }
         )
         row = {
-            "record_schema_version": 4,
+            "record_schema_version": 5,
             "analysis_backend": "independent",
             "analysis_signature": args.analysis_signature,
             "worker_rank": args.rank,
@@ -438,6 +448,7 @@ def main() -> None:
             "loss": group_loss,
             "zero_advantage": zero_advantage,
             "gradient_parameter_scope": args.gradient_parameter_scope,
+            "svd_score_scope": args.svd_score_scope,
             "svd_rank": args.svd_rank,
             "svd_method": "torch.svd_lowrank",
             "svd_q": args.svd_rank + args.svd_oversample,

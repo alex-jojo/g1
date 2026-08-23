@@ -154,6 +154,11 @@ Important arguments:
 - `--n_samples_train`, `--n_samples_val`: rollout counts used in gradient estimation (`k_r`, `k_v`).
 - `--iters_per_select`: GRPO update steps between selection rounds.
 - `--num_selections`: number of selection rounds.
+- `--analysis_backend independent`: run one full-model SVD worker per GPU.
+- `--svd_score_scope`: choose `qkvo_only`, `ffn_only`, or `transformer_2d` for
+  the final independent S score. All three modes still compute and record Q/K/V/O,
+  gate/up/down matrix statistics; the scope changes scoring, not recording.
+
 
 The example scores 2560 prompts, selects the top 1280 by SVD effective-rank score,
 then trains exactly 10 GRPO global steps (one epoch at batch size 128) before selecting again.

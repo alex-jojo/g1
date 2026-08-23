@@ -68,12 +68,14 @@ def main():
     parser.add_argument("--svd_rank", default=128, type=int,
                         help="Number of leading singular values saved per 2-D layer gradient in svd mode")
     parser.add_argument(
+        "--svd_score_scope",
         "--svd_parameter_scope",
-        choices=["qkvo_only", "transformer_2d"],
+        dest="svd_score_scope",
+        choices=["qkvo_only", "ffn_only", "transformer_2d"],
         default=None,
         help=(
-            "Matrix weights included in SVD. Defaults to transformer_2d for "
-            "the independent backend and qkvo_only for FSDP."
+            "Matrix families included in S. Independent always records all seven; "
+            "the old --svd_parameter_scope name remains as an alias."
         ),
     )
 
@@ -95,15 +97,15 @@ def main():
         parser.error("--analysis_backend independent is only supported with --mode svd")
     if args.analysis_backend == "independent" and args.mini_batch_size != 1:
         parser.error("Independent SVD currently requires --mini_batch_size 1")
-    if args.svd_parameter_scope is None:
-        args.svd_parameter_scope = (
+    if args.svd_score_scope is None:
+        args.svd_score_scope = (
             "transformer_2d"
             if args.analysis_backend == "independent"
             else "qkvo_only"
         )
-    if args.analysis_backend != "independent" and args.svd_parameter_scope != "qkvo_only":
+    if args.analysis_backend != "independent" and args.svd_score_scope != "qkvo_only":
         parser.error(
-            "--svd_parameter_scope transformer_2d requires "
+            "Non-QKVO SVD score scopes require "
             "--analysis_backend independent"
         )
     if args.num_gpus <= 0 or args.rollout_n <= 0 or args.prepare_workers <= 0:
@@ -158,7 +160,8 @@ def main():
                 "--max_length", str(args.max_length),
                 "--prepare_workers", str(args.prepare_workers),
                 "--svd_rank", str(args.svd_rank),
-                "--gradient_parameter_scope", args.svd_parameter_scope,
+                "--gradient_parameter_scope", "transformer_2d",
+                "--svd_score_scope", args.svd_score_scope,
             ]
             if args.expected_groups is not None:
                 cmd.extend(["--expected_groups", str(args.expected_groups)])

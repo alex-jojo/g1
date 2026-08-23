@@ -17,6 +17,7 @@ MATRIX_STAT_KEYS = (
     "spectral_norm",
     "stable_rank",
     "topk_energy_ratio",
+    "topk_effective_rank",
 )
 GROUP_LIST_KEYS = (
     "global_indices",
@@ -33,6 +34,10 @@ GROUP_LIST_KEYS = (
     "rewards",
     "advantages",
 )
+
+SCORE_SCOPES = ("qkvo_only", "ffn_only", "transformer_2d")
+QKVO_FAMILIES = ("Q", "K", "V", "O")
+FFN_FAMILIES = ("GATE", "UP", "DOWN")
 
 
 def read_rows(path: str) -> List[Dict[str, Any]]:
@@ -60,7 +65,7 @@ def existing_matches_signature(path: str, signature: str) -> bool:
 
 def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
     group_id = int(row["group_id"])
-    if row.get("record_schema_version") != 4:
+    if row.get("record_schema_version") != 5:
         raise ValueError(f"group_id={group_id} has an unsupported record schema")
     if int(row.get("worker_rank", -1)) != rank:
         raise ValueError(f"group_id={group_id} has the wrong worker_rank")
@@ -84,9 +89,51 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
             raise ValueError(
                 f"group_id={group_id} matrix={matrix_name} has energy ratio {ratio}"
             )
+    if row.get("gradient_parameter_scope") != "transformer_2d":
+        raise ValueError(f"group_id={group_id} did not record QKVO and FFN")
+    score_scope = row.get("svd_score_scope")
+    if score_scope not in SCORE_SCOPES:
+        raise ValueError(f"group_id={group_id} has invalid SVD score scope")
+    score_record = row.get("effective_rank_topk")
+    if not isinstance(score_record, dict):
+        raise ValueError(f"group_id={group_id} has no effective-rank record")
+    if score_record.get("score_scope") != score_scope:
+        raise ValueError(f"group_id={group_id} has inconsistent score scope")
+    family_sums = score_record.get("per_family_layer_sum")
+    if not isinstance(family_sums, dict):
+        raise ValueError(f"group_id={group_id} has no family score sums")
+    expected_families = set(QKVO_FAMILIES + FFN_FAMILIES)
+    if set(family_sums) != expected_families:
+        raise ValueError(f"group_id={group_id} did not record all seven families")
+    scores_by_scope = score_record.get("scores_by_scope")
+    if not isinstance(scores_by_scope, dict):
+        raise ValueError(f"group_id={group_id} has no per-scope scores")
+    expected_scores = {
+        "qkvo_only": math.fsum(float(family_sums[key]) for key in QKVO_FAMILIES),
+        "ffn_only": math.fsum(float(family_sums[key]) for key in FFN_FAMILIES),
+        "transformer_2d": math.fsum(
+            float(family_sums[key]) for key in QKVO_FAMILIES + FFN_FAMILIES
+        ),
+    }
+    for scope, expected_score in expected_scores.items():
+        try:
+            actual_score = float(scores_by_scope[scope])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"group_id={group_id} has invalid {scope} score") from error
+        if not math.isfinite(actual_score) or not math.isclose(
+            actual_score, expected_score, rel_tol=1e-12, abs_tol=1e-12
+        ):
+            raise ValueError(f"group_id={group_id} has inconsistent {scope} score")
+    selected_score = float(score_record["s"])
+    if not math.isfinite(selected_score) or not math.isclose(
+        selected_score, expected_scores[score_scope], rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise ValueError(f"group_id={group_id} selected the wrong SVD score")
     stats = row.get("group_stats")
     if not isinstance(stats, dict):
         raise ValueError(f"group_id={group_id} has no group_stats")
+    if stats.get("svd_score_scope") != score_scope:
+        raise ValueError(f"group_id={group_id} has inconsistent group score scope")
     for key in GROUP_LIST_KEYS:
         if not isinstance(stats.get(key), list) or len(stats[key]) != rollout_n:
             raise ValueError(

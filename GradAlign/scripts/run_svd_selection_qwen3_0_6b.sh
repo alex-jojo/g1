@@ -40,7 +40,7 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-5120}"
 
 SVD_RANK="${SVD_RANK:-128}"
-SVD_PARAMETER_SCOPE="${SVD_PARAMETER_SCOPE:-transformer_2d}"
+SVD_SCORE_SCOPE="${SVD_SCORE_SCOPE:-${SVD_PARAMETER_SCOPE:-transformer_2d}}"
 ANALYSIS_BACKEND="${ANALYSIS_BACKEND:-independent}"
 ANALYSIS_MINIBATCH_SIZE="${ANALYSIS_MINIBATCH_SIZE:-1}"
 ANALYSIS_PREPARE_WORKERS="${ANALYSIS_PREPARE_WORKERS:-32}"
@@ -90,12 +90,12 @@ if [[ "${ANALYSIS_BACKEND}" == "independent" && "${ANALYSIS_MINIBATCH_SIZE}" != 
   echo "Independent SVD requires ANALYSIS_MINIBATCH_SIZE=1" >&2
   exit 2
 fi
-if [[ "${SVD_PARAMETER_SCOPE}" != "qkvo_only" && "${SVD_PARAMETER_SCOPE}" != "transformer_2d" ]]; then
-  echo "SVD_PARAMETER_SCOPE must be qkvo_only or transformer_2d" >&2
+if [[ "${SVD_SCORE_SCOPE}" != "qkvo_only" && "${SVD_SCORE_SCOPE}" != "ffn_only" && "${SVD_SCORE_SCOPE}" != "transformer_2d" ]]; then
+  echo "SVD_SCORE_SCOPE must be qkvo_only, ffn_only, or transformer_2d" >&2
   exit 2
 fi
-if [[ "${SVD_PARAMETER_SCOPE}" == "transformer_2d" && "${ANALYSIS_BACKEND}" != "independent" ]]; then
-  echo "SVD_PARAMETER_SCOPE=transformer_2d requires ANALYSIS_BACKEND=independent" >&2
+if [[ "${SVD_SCORE_SCOPE}" != "qkvo_only" && "${ANALYSIS_BACKEND}" != "independent" ]]; then
+  echo "Non-QKVO SVD_SCORE_SCOPE requires ANALYSIS_BACKEND=independent" >&2
   exit 2
 fi
 
@@ -180,7 +180,7 @@ CMD=(
   --max_model_len "${MAX_MODEL_LEN}"
   --analysis_num_gpus "${N_GPUS}"
   --svd_rank "${SVD_RANK}"
-  --svd_parameter_scope "${SVD_PARAMETER_SCOPE}"
+  --svd_score_scope "${SVD_SCORE_SCOPE}"
   --training_backend fsdp
   --merge_backend fsdp
   --n_gpus_per_node "${N_GPUS}"
@@ -208,8 +208,8 @@ printf 'Training: total_steps=%d, selections=%d, batch=%d, rollout_n=%d, GPUs=%d
 printf 'Inference: replicas=%d, TP=%d, PP=%d, GPUs/replica=%d\n' \
   "${INFERENCE_CONCURRENCY}" "${INFERENCE_TENSOR_PARALLEL_SIZE}" \
   "${INFERENCE_PIPELINE_PARALLEL_SIZE}" "${GPUS_PER_INFERENCE_REPLICA}"
-printf 'Analysis: backend=%s, scope=%s, workers=%d, micro_batch=%d, prepare_workers=%d\n' \
-  "${ANALYSIS_BACKEND}" "${SVD_PARAMETER_SCOPE}" "${N_GPUS}" \
+printf 'Analysis: backend=%s, score_scope=%s, recorded_scope=transformer_2d, workers=%d, micro_batch=%d, prepare_workers=%d\n' \
+  "${ANALYSIS_BACKEND}" "${SVD_SCORE_SCOPE}" "${N_GPUS}" \
   "${ANALYSIS_MINIBATCH_SIZE}" "${ANALYSIS_PREPARE_WORKERS}"
 printf 'Checkpoints: %s\n' "${CKPT_ROOT}"
 printf 'Reward function: %s\n' "${REWARD_PATH}"

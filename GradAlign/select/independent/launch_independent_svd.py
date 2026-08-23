@@ -92,8 +92,16 @@ def main() -> None:
         choices=["qkvo_only", "transformer_2d"],
         default="transformer_2d",
     )
+    parser.add_argument(
+        "--svd_score_scope",
+        choices=["qkvo_only", "ffn_only", "transformer_2d"],
+        default="transformer_2d",
+    )
     parser.add_argument("--force_prepare", action="store_true")
     args = parser.parse_args()
+
+    if args.gradient_parameter_scope != "transformer_2d":
+        parser.error("Independent SVD always records QKVO and FFN matrices")
 
     if args.num_workers <= 0 or args.rollout_n <= 0:
         parser.error("num_workers and rollout_n must be positive")
@@ -136,7 +144,7 @@ def main() -> None:
     with open(manifest_path, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     analysis_config = {
-        "record_schema_version": 4,
+        "record_schema_version": 5,
         "analysis_backend": "independent",
         "advantage_estimator": "grpo",
         "norm_adv_by_std_in_grpo": True,
@@ -152,6 +160,7 @@ def main() -> None:
         "rollout_n": args.rollout_n,
         "analysis_minibatch_size": 1,
         "gradient_parameter_scope": args.gradient_parameter_scope,
+        "svd_score_scope": args.svd_score_scope,
         "matrix_statistics": [
             "frobenius_norm",
             "spectral_norm",
@@ -174,6 +183,7 @@ def main() -> None:
     manifest["analysis"] = analysis_config
     manifest["analysis_signature"] = signature
     manifest["gradient_parameter_scope"] = args.gradient_parameter_scope
+    manifest["svd_score_scope"] = args.svd_score_scope
     atomic_write_json(manifest_path, manifest)
     print(f"Independent analysis signature: {signature}", flush=True)
 
@@ -224,6 +234,8 @@ def main() -> None:
             str(args.svd_seed),
             "--gradient_parameter_scope",
             args.gradient_parameter_scope,
+            "--svd_score_scope",
+            args.svd_score_scope,
         ]
         worker_env = os.environ.copy()
         worker_env["CUDA_VISIBLE_DEVICES"] = device

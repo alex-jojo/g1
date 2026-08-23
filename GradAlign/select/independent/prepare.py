@@ -426,7 +426,7 @@ def main() -> None:
     manifest = {
         **expected_manifest_fields,
         "analysis_minibatch_size": 1,
-        "gradient_parameter_scope": "qkvo_only",
+        "gradient_parameter_scope": "transformer_2d",
         "expected_groups": len(grouped_entries),
         "expected_responses": len(entries),
         "all_group_ids": sorted(seen_groups),
