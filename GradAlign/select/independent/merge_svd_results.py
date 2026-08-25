@@ -65,14 +65,18 @@ def existing_matches_signature(path: str, signature: str) -> bool:
 
 def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
     group_id = int(row["group_id"])
-    if row.get("record_schema_version") != 5:
-        raise ValueError(f"group_id={group_id} has an unsupported record schema")
+    analysis_method = row.get("analysis_method", "effective_rank")
+    expected_schema = 6 if analysis_method == "subspace" else 5
+    if row.get("record_schema_version") != expected_schema:
+        raise ValueError(
+            f"group_id={group_id} has an unsupported record schema for "
+            f"{analysis_method}"
+        )
     if int(row.get("worker_rank", -1)) != rank:
         raise ValueError(f"group_id={group_id} has the wrong worker_rank")
     matrices = row.get("matrices")
     if not isinstance(matrices, dict) or not matrices:
         raise ValueError(f"group_id={group_id} has no matrix results")
-    analysis_method = row.get("analysis_method", "effective_rank")
     if analysis_method not in {"effective_rank", "subspace"}:
         raise ValueError(f"group_id={group_id} has invalid analysis method")
     for matrix_name, matrix in matrices.items():
@@ -172,6 +176,53 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
         raise ValueError(f"group_id={group_id} has inconsistent AdamW target")
     if stats.get("analysis_method", "effective_rank") != analysis_method:
         raise ValueError(f"group_id={group_id} has inconsistent analysis method")
+    if analysis_method == "subspace":
+        zero_advantage = row.get("zero_advantage")
+        marginal_delta_all_zero = row.get("marginal_delta_all_zero")
+        selection_eligible = row.get("selection_eligible")
+        selection_filter_reason = row.get("selection_filter_reason")
+        for field_name, field_value in (
+            ("zero_advantage", zero_advantage),
+            ("marginal_delta_all_zero", marginal_delta_all_zero),
+            ("selection_eligible", selection_eligible),
+        ):
+            if not isinstance(field_value, bool):
+                raise ValueError(
+                    f"group_id={group_id} has invalid {field_name} filtering metadata"
+                )
+            if stats.get(field_name) is not field_value:
+                raise ValueError(
+                    f"group_id={group_id} has inconsistent group_stats.{field_name}"
+                )
+        matrix_all_zero = all(
+            float(matrix["frobenius_norm"]) == 0.0 for matrix in matrices.values()
+        )
+        expected_marginal_delta_all_zero = (
+            update_target == "marginal_data" and matrix_all_zero
+        )
+        if marginal_delta_all_zero is not expected_marginal_delta_all_zero:
+            raise ValueError(
+                f"group_id={group_id} has inconsistent marginal_delta_all_zero"
+            )
+        expected_filter_reason = (
+            "zero_advantage"
+            if zero_advantage
+            else "zero_marginal_delta"
+            if expected_marginal_delta_all_zero
+            else None
+        )
+        if selection_filter_reason != expected_filter_reason:
+            raise ValueError(
+                f"group_id={group_id} has the wrong selection_filter_reason"
+            )
+        if stats.get("selection_filter_reason") != selection_filter_reason:
+            raise ValueError(
+                f"group_id={group_id} has inconsistent filtering reason"
+            )
+        if selection_eligible is not (expected_filter_reason is None):
+            raise ValueError(
+                f"group_id={group_id} has inconsistent selection eligibility"
+            )
     for key in GROUP_LIST_KEYS:
         if not isinstance(stats.get(key), list) or len(stats[key]) != rollout_n:
             raise ValueError(
@@ -225,6 +276,14 @@ def validate_record(row: Dict[str, Any], rank: int, rollout_n: int) -> None:
             float(advantage), expected_advantage, rel_tol=1e-6, abs_tol=1e-6
         ):
             raise ValueError(f"group_id={group_id} has inconsistent advantages")
+    if analysis_method == "subspace":
+        expected_zero_advantage = all(
+            abs(float(advantage)) < 1e-6 for advantage in stats["advantages"]
+        )
+        if row["zero_advantage"] is not expected_zero_advantage:
+            raise ValueError(
+                f"group_id={group_id} has inconsistent zero_advantage flag"
+            )
     for index in range(rollout_n):
         prompt_tokens = int(stats["prompt_tokens"][index])
         generated_tokens = int(stats["generated_response_tokens"][index])

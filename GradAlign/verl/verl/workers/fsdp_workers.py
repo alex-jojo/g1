@@ -523,7 +523,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_optimizer = optim.AdamW(
                 actor_module_fsdp.parameters(),
                 lr=optim_config.lr,
-                betas=optim_config.get("betas", (0.9, 0.999)),
+                betas=tuple(optim_config.get("betas", (0.9, 0.999))),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
             )
 

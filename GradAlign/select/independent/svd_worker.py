@@ -328,9 +328,23 @@ def compute_group_svd(
     seed: int,
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
+    zero_marginal_subspace = (
+        analysis_method == "subspace"
+        and gradient_source == "adamw"
+        and adamw_update_target == "marginal_data"
+        and zero_advantage
+    )
     for name, parameter in parameter_specs:
-        if gradient_source == "raw" and zero_advantage:
+        if (gradient_source == "raw" and zero_advantage) or zero_marginal_subspace:
             result = zero_svd_result(parameter.shape, svd_rank)
+            if analysis_method == "subspace":
+                result.update(
+                    {
+                        "subspace_rank": min(svd_rank, min(parameter.shape)),
+                        "subspace_phi_u": 0.0,
+                        "subspace_phi_v": 0.0,
+                    }
+                )
         else:
             if parameter.grad is None and not zero_advantage:
                 raise RuntimeError(f"Missing matrix gradient for {name}")
@@ -418,7 +432,7 @@ def main() -> None:
     parser.add_argument(
         "--subspace_score_side",
         choices=["u", "v", "mean"],
-        default="u",
+        default="mean",
     )
     parser.add_argument(
         "--adamw_update_target",
@@ -556,6 +570,21 @@ def main() -> None:
             niter=args.svd_niter,
             seed=args.svd_seed,
         )
+        marginal_delta_all_zero = (
+            args.analysis_method == "subspace"
+            and args.adamw_update_target == "marginal_data"
+            and all(
+                float(matrix_result["frobenius_norm"]) == 0.0
+                for matrix_result in matrix_results.values()
+            )
+        )
+        selection_filter_reason = None
+        if args.analysis_method == "subspace":
+            if zero_advantage:
+                selection_filter_reason = "zero_advantage"
+            elif marginal_delta_all_zero:
+                selection_filter_reason = "zero_marginal_delta"
+        selection_eligible = selection_filter_reason is None
         effective_rank_score = aggregate_effective_rank(
             matrix_results,
             args.svd_rank,
@@ -582,6 +611,9 @@ def main() -> None:
                 "worker_rank": args.rank,
                 "loss": group_loss,
                 "zero_advantage": zero_advantage,
+                "marginal_delta_all_zero": marginal_delta_all_zero,
+                "selection_eligible": selection_eligible,
+                "selection_filter_reason": selection_filter_reason,
                 "analysis_method": args.analysis_method,
                 "svd_gradient_source": args.svd_gradient_source,
                 "adamw_update_target": (
@@ -616,13 +648,16 @@ def main() -> None:
             }
         )
         row = {
-            "record_schema_version": 5,
+            "record_schema_version": 6 if args.analysis_method == "subspace" else 5,
             "analysis_backend": "independent",
             "analysis_signature": args.analysis_signature,
             "worker_rank": args.rank,
             "group_id": group_id,
             "loss": group_loss,
             "zero_advantage": zero_advantage,
+            "marginal_delta_all_zero": marginal_delta_all_zero,
+            "selection_eligible": selection_eligible,
+            "selection_filter_reason": selection_filter_reason,
             "analysis_method": args.analysis_method,
             "svd_gradient_source": args.svd_gradient_source,
             "adamw_update_target": (
@@ -653,6 +688,8 @@ def main() -> None:
         print(
             f"[worker {args.rank}] {completed_index}/{len(remaining_groups)} "
             f"group_id={group_id} zero={zero_advantage} "
+            f"eligible={selection_eligible} "
+            f"filter_reason={selection_filter_reason} "
             f"method={args.analysis_method} score={selection_score:.6f} "
             f"elapsed={time() - started:.1f}s",
             flush=True,

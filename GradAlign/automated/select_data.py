@@ -6,6 +6,7 @@ import argparse
 import random
 import math
 import hashlib
+from collections import Counter
 from datetime import datetime, timezone
 from typing import List, Set, Dict, Tuple, Optional
 
@@ -156,9 +157,18 @@ def _read_svd_score_map(svd_jsonl_path: str) -> Dict[int, float]:
 
 def _read_subspace_score_data(
     score_path: str,
-) -> Tuple[Dict[int, float], Optional[str], Optional[str], Optional[str]]:
-    """Read the per-prompt normalized U/V subspace selection score."""
+) -> Tuple[
+    Dict[int, float],
+    Dict[int, str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
+    """Read eligible AdamW-update scores and separately track filtered rows."""
     score_map: Dict[int, float] = {}
+    filtered_map: Dict[int, str] = {}
+    update_targets: Set[str] = set()
     signatures: Set[str] = set()
     scopes: Set[str] = set()
     sides: Set[str] = set()
@@ -171,6 +181,9 @@ def _read_subspace_score_data(
                 group_id = int(row["group_id"])
                 record = row["subspace_similarity"]
                 score = float(record["s"])
+                selection_eligible = row["selection_eligible"]
+                filter_reason = row.get("selection_filter_reason")
+                update_target = row["adamw_update_target"]
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
                 raise SystemExit(
                     f"Invalid subspace score in {score_path}:{line_number}"
@@ -179,11 +192,40 @@ def _read_subspace_score_data(
                 raise SystemExit(
                     f"Out-of-range subspace score for group_id={group_id}: {score}"
                 )
-            if group_id in score_map:
+            if update_target not in {"actual_data", "marginal_data", "full"}:
+                raise SystemExit(
+                    f"Invalid AdamW update target for group_id={group_id}: "
+                    f"{update_target}"
+                )
+            if not isinstance(selection_eligible, bool):
+                raise SystemExit(
+                    f"Invalid selection_eligible for group_id={group_id}"
+                )
+            if group_id in score_map or group_id in filtered_map:
                 raise SystemExit(
                     f"Duplicate group_id={group_id} in {score_path}:{line_number}"
                 )
-            score_map[group_id] = score
+            if selection_eligible:
+                if filter_reason is not None:
+                    raise SystemExit(
+                        f"Eligible group_id={group_id} unexpectedly has a filter reason"
+                    )
+                score_map[group_id] = score
+            else:
+                if filter_reason not in {"zero_advantage", "zero_marginal_delta"}:
+                    raise SystemExit(
+                        f"Invalid filter reason for group_id={group_id}: {filter_reason}"
+                    )
+                if (
+                    filter_reason == "zero_marginal_delta"
+                    and update_target != "marginal_data"
+                ):
+                    raise SystemExit(
+                        f"group_id={group_id} has a marginal-data filter reason "
+                        f"for update target {update_target}"
+                    )
+                filtered_map[group_id] = filter_reason
+            update_targets.add(update_target)
             signature = row.get("analysis_signature")
             scope = record.get("score_scope")
             side = record.get("score_side")
@@ -193,10 +235,17 @@ def _read_subspace_score_data(
                 scopes.add(scope)
             if isinstance(side, str) and side:
                 sides.add(side)
-    if len(signatures) > 1 or len(scopes) > 1 or len(sides) > 1:
+    if (
+        len(update_targets) > 1
+        or len(signatures) > 1
+        or len(scopes) > 1
+        or len(sides) > 1
+    ):
         raise SystemExit(f"Mixed subspace configurations in {score_path}")
     return (
         score_map,
+        filtered_map,
+        next(iter(update_targets), None),
         next(iter(signatures), None),
         next(iter(scopes), None),
         next(iter(sides), None),
@@ -389,29 +438,46 @@ def select_by_subspace_score(
     )
     if not os.path.isfile(score_path):
         raise SystemExit(f"Aggregated subspace score file not found: {score_path}")
-    score_map, signature, score_scope, score_side = _read_subspace_score_data(
-        score_path
-    )
-    if not score_map or top_n <= 0:
-        raise SystemExit("Subspace selection needs scores and a positive count")
+    (
+        score_map,
+        filtered_map,
+        update_target,
+        signature,
+        score_scope,
+        score_side,
+    ) = _read_subspace_score_data(score_path)
+    if top_n <= 0:
+        raise SystemExit("Subspace selection needs a positive selection count")
 
     dataset_train = os.path.join(dataset_dir, "train.jsonl")
     candidate_group_ids = _read_candidate_group_ids(dataset_train)
     candidate_set = set(candidate_group_ids)
-    scored_set = set(score_map)
-    if candidate_set != scored_set:
-        missing_scores = sorted(candidate_set.difference(scored_set))
-        unknown_scores = sorted(scored_set.difference(candidate_set))
+    analyzed_set = set(score_map).union(filtered_map)
+    if candidate_set != analyzed_set:
+        missing_scores = sorted(candidate_set.difference(analyzed_set))
+        unknown_scores = sorted(analyzed_set.difference(candidate_set))
         raise SystemExit(
             "Candidate/subspace group_id mismatch: "
-            f"candidates={len(candidate_set)}, scored={len(scored_set)}, "
+            f"candidates={len(candidate_set)}, analyzed={len(analyzed_set)}, "
             f"missing_scores={len(missing_scores)} {missing_scores[:10]}, "
             f"unknown_scores={len(unknown_scores)} {unknown_scores[:10]}"
+        )
+    if len(candidate_group_ids) % 2 != 0 or top_n * 2 != len(candidate_group_ids):
+        raise SystemExit(
+            "Subspace selection must keep exactly 50% of the original candidate "
+            f"pool: candidates={len(candidate_group_ids)}, requested={top_n}"
         )
 
     ordered = sorted(score_map.items(), key=lambda item: (-item[1], item[0]))
     requested_top_n = top_n
-    top_n = min(top_n, len(ordered))
+    if len(ordered) < top_n:
+        filter_counts = dict(sorted(Counter(filtered_map.values()).items()))
+        raise SystemExit(
+            "Not enough eligible AdamW-update candidates after filtering: "
+            f"eligible={len(ordered)}, required={top_n}, "
+            f"filtered={len(filtered_map)} {filter_counts}. "
+            "Filtered rows will not be used as backfill."
+        )
     boundary_start = max(0, top_n - 10)
     print(
         "Subspace scores at selection boundary:",
@@ -429,26 +495,57 @@ def select_by_subspace_score(
     if set(selected_rows) != selected_ids or len(selected_rows) != len(selected_ids):
         raise SystemExit("Selected dataset does not match subspace ranking")
 
-    selection_score_rows = [
-        {
-            "group_id": group_id,
-            "score": score,
-            "rank": rank,
-            "selected": rank <= top_n,
-        }
-        for rank, (group_id, score) in enumerate(ordered, 1)
-    ]
+    rank_by_group_id = {
+        group_id: rank for rank, (group_id, _) in enumerate(ordered, 1)
+    }
+    selection_score_rows = []
+    for group_id in candidate_group_ids:
+        if group_id in score_map:
+            rank = rank_by_group_id[group_id]
+            selection_score_rows.append(
+                {
+                    "group_id": group_id,
+                    "score": score_map[group_id],
+                    "rank": rank,
+                    "selected": rank <= top_n,
+                    "selection_eligible": True,
+                    "filter_reason": None,
+                }
+            )
+        else:
+            selection_score_rows.append(
+                {
+                    "group_id": group_id,
+                    "score": None,
+                    "rank": None,
+                    "selected": False,
+                    "selection_eligible": False,
+                    "filter_reason": filtered_map[group_id],
+                }
+            )
     selection_scores_path = os.path.join(output_dir, "selection_scores.jsonl")
     _atomic_write_jsonl(selection_scores_path, selection_score_rows)
     manifest = {
-        "selection_schema_version": 1,
-        "selection_method": "adamw_backbone_subspace_topk_descending",
+        "selection_schema_version": 2,
+        "selection_method": (
+            f"adamw_{update_target}_backbone_subspace_top50_descending"
+        ),
+        "adamw_update_target": update_target,
         "iteration": iteration,
         "global_step": global_step,
         "candidate_count": len(candidate_group_ids),
+        "analyzed_candidate_count": len(analyzed_set),
         "scored_candidate_count": len(score_map),
+        "eligible_candidate_count": len(score_map),
+        "filtered_candidate_count": len(filtered_map),
+        "filtered_counts_by_reason": dict(
+            sorted(Counter(filtered_map.values()).items())
+        ),
         "requested_selected_count": requested_top_n,
         "selected_count": len(selected_ids),
+        "selection_fraction_of_candidates": (
+            len(selected_ids) / len(candidate_group_ids)
+        ),
         "score_cutoff": float(ordered[top_n - 1][1]),
         "score_min": float(min(score_map.values())),
         "score_max": float(max(score_map.values())),

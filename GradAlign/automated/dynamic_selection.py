@@ -279,7 +279,7 @@ def _independent_analysis_is_compatible(
         else None
     )
     expected = {
-        "record_schema_version": 5,
+        "record_schema_version": 6 if analysis_method == "subspace" else 5,
         "analysis_backend": "independent",
         "analysis_method": analysis_method,
         "advantage_estimator": "grpo",
@@ -360,7 +360,8 @@ def _independent_analysis_is_compatible(
     return (
         first_row.get("analysis_backend") == "independent"
         and first_row.get("analysis_signature") == signature
-        and first_row.get("record_schema_version") == 5
+        and first_row.get("record_schema_version")
+        == (6 if analysis_method == "subspace" else 5)
         and first_row.get("analysis_method", "effective_rank") == analysis_method
         and first_row.get("gradient_parameter_scope") == "transformer_2d"
         and first_row.get("svd_gradient_source") == svd_gradient_source
@@ -513,7 +514,7 @@ def main():
     parser.add_argument(
         "--subspace_score_side",
         choices=["u", "v", "mean"],
-        default="u",
+        default="mean",
         help="Use left, right, or their mean backbone/update subspace overlap",
     )
     parser.add_argument(
@@ -584,6 +585,8 @@ def main():
         )
     if args.mode == "subspace" and args.svd_gradient_source != "adamw":
         parser.error("--mode subspace requires --svd_gradient_source adamw")
+    if args.mode == "subspace" and args.k != 2:
+        parser.error("--mode subspace keeps exactly 50% and therefore requires --k 2")
     if args.mode == "subspace" and not args.model_path:
         parser.error(
             "--mode subspace requires --model_path as the fixed initial backbone"

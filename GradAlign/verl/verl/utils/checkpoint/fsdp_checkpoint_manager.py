@@ -48,6 +48,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+def _normalize_optimizer_param_groups(optimizer: torch.optim.Optimizer) -> None:
+    """Convert config-backed Adam betas into checkpoint-safe Python tuples."""
+
+    for param_group in optimizer.param_groups:
+        betas = param_group.get("betas")
+        if betas is not None and not isinstance(betas, tuple):
+            param_group["betas"] = tuple(betas)
+
+
 @dataclass
 class FSDPConfig:
     """Configuration for FSDP checkpointing.
@@ -188,6 +197,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
     def _save_optimizer_for_analysis(self, local_path: str) -> None:
         """Collect one full AdamW snapshot keyed by original parameter names."""
 
+        # Optimizer state restored from an older shard may still contain an
+        # OmegaConf ListConfig, which PyTorch's state-dict walker cannot gather.
+        _normalize_optimizer_param_groups(self.optimizer)
         optimizer_state = get_optimizer_state_dict(
             self.model,
             self.optimizer,

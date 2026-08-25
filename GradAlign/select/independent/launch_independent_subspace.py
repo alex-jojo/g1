@@ -105,12 +105,12 @@ def main() -> None:
     parser.add_argument(
         "--subspace_score_side",
         choices=["u", "v", "mean"],
-        default="u",
+        default="mean",
     )
     parser.add_argument(
         "--adamw_update_target",
         choices=["actual_data", "marginal_data", "full"],
-        default="full",
+        default="marginal_data",
     )
     parser.add_argument("--adamw_lr", type=float, default=1e-6)
     parser.add_argument("--adamw_beta1", type=float, default=0.9)
@@ -214,7 +214,7 @@ def main() -> None:
     with open(manifest_path, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     analysis_config = {
-        "record_schema_version": 5,
+        "record_schema_version": 6,
         "analysis_backend": "independent",
         "analysis_method": "subspace",
         "advantage_estimator": "grpo",

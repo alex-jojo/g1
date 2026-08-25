@@ -97,7 +97,7 @@ def main():
     parser.add_argument(
         "--subspace_score_side",
         choices=["u", "v", "mean"],
-        default="u",
+        default="mean",
     )
     parser.add_argument(
         "--svd_score_scope",
